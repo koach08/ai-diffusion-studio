@@ -1,0 +1,40 @@
+# Settings with API keys
+app/settings.json
+
+# Python
+*.pyc
+__pycache__/
+venv/
+.venv/
+
+# Environment files
+.env
+.env.local
+.env*.local
+
+# Node
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Outputs (generated images/videos)
+outputs/
+
+# ComfyUI / Forge local installations (cloned repos, too large)
+comfyui/
+sd-webui-forge/
+
+# Models (too large for git)
+models/
+
+# Error logs
+app/error.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
