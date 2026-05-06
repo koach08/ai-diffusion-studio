@@ -1,6 +1,9 @@
 # Settings with API keys
 app/settings.json
 
+# Session state
+app/session.json
+
 # Python
 *.pyc
 __pycache__/

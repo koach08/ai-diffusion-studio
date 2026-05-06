@@ -10,6 +10,57 @@ import threading
 CIVITAI_API_URL = "https://civitai.com/api/v1"
 CIVITAI_ORCHESTRATION_URL = "https://orchestration.civitai.com"
 
+# ── iCloud model → CivitAI URN cache ──
+_URN_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icloud_urn_cache.json")
+_urn_cache = {}
+
+
+def _load_urn_cache():
+    global _urn_cache
+    if os.path.exists(_URN_CACHE_FILE):
+        try:
+            with open(_URN_CACHE_FILE, "r") as f:
+                _urn_cache = json.load(f)
+        except Exception:
+            _urn_cache = {}
+
+
+def _save_urn_cache():
+    with open(_URN_CACHE_FILE, "w") as f:
+        json.dump(_urn_cache, f, indent=2, ensure_ascii=False)
+
+
+def _base_model_to_urn_prefix(base_model_str):
+    """Map CivitAI baseModel string to URN prefix (sdxl, sd1, flux1, etc.)."""
+    bm = (base_model_str or "").lower()
+    if "flux" in bm:
+        return "flux1"
+    if "sdxl" in bm or "pony" in bm or "illustrious" in bm:
+        return "sdxl"
+    if "sd 1" in bm or "sd1" in bm:
+        return "sd1"
+    if "sd 2" in bm or "sd2" in bm:
+        return "sd2"
+    return "sdxl"
+
+
+def _base_model_to_api_format(base_model_str):
+    """Map CivitAI baseModel string to Orchestration API format (SDXL, SD_1_5, etc.)."""
+    bm = (base_model_str or "").lower()
+    if "flux" in bm:
+        return "Flux1"
+    if "sdxl" in bm or "pony" in bm or "illustrious" in bm:
+        return "SDXL"
+    if "sd 1" in bm or "sd1" in bm:
+        return "SD_1_5"
+    if "sd 2" in bm or "sd2" in bm:
+        return "SD_2_1"
+    return "SDXL"
+
+
+# Load cache on import
+_load_urn_cache()
+
 # Popular NSFW-capable models (pre-configured for easy generation)
 CIVITAI_GENERATION_MODELS = {
     # ── SDXL系 (高品質・1024px推奨) ──
@@ -250,8 +301,12 @@ class CivitAIClient:
 
     def generate_image(self, model_key, prompt, negative_prompt="",
                        width=512, height=768, steps=25, cfg_scale=7,
-                       scheduler="EulerA", seed=-1, clip_skip=2, quantity=1):
-        """Generate image via CivitAI Cloud GPU. Returns list of image URLs."""
+                       scheduler="EulerA", seed=-1, clip_skip=2, quantity=1,
+                       lora_urns=None):
+        """Generate image via CivitAI Cloud GPU. Returns list of image URLs.
+
+        lora_urns: list of (urn_string, strength) tuples for additionalNetworks.
+        """
         model_info = CIVITAI_GENERATION_MODELS.get(model_key)
         if not model_info:
             raise ValueError(f"不明なモデル: {model_key}")
@@ -280,6 +335,13 @@ class CivitAIClient:
             },
             "quantity": quantity,
         }
+
+        # LoRA support via additionalNetworks
+        if lora_urns:
+            networks = {}
+            for lora_urn, strength in lora_urns:
+                networks[lora_urn] = {"type": "Lora", "strength": float(strength)}
+            job_input["additionalNetworks"] = networks
 
         # Submit job
         result = self._orchestration_request("POST", "/v1/consumer/jobs", job_input)
@@ -339,8 +401,12 @@ class CivitAIClient:
 
     def generate_image_by_urn(self, model_urn, base_model, prompt, negative_prompt="",
                                width=512, height=768, steps=25, cfg_scale=7,
-                               scheduler="EulerA", seed=-1, quantity=1):
-        """Generate using a custom model URN (for search results)."""
+                               scheduler="EulerA", seed=-1, quantity=1,
+                               lora_urns=None):
+        """Generate using a custom model URN (for search results).
+
+        lora_urns: list of (urn_string, strength) tuples for additionalNetworks.
+        """
         w = min(max(64, width), 1024)
         h = min(max(64, height), 1024)
         job_input = {
@@ -359,6 +425,14 @@ class CivitAIClient:
             },
             "quantity": quantity,
         }
+
+        # LoRA support via additionalNetworks
+        if lora_urns:
+            networks = {}
+            for lora_urn, strength in lora_urns:
+                networks[lora_urn] = {"type": "Lora", "strength": float(strength)}
+            job_input["additionalNetworks"] = networks
+
         result = self._orchestration_request("POST", "/v1/consumer/jobs", job_input)
         token = result.get("token", "")
         if not token:
@@ -380,6 +454,132 @@ class CivitAIClient:
             "note": "Training is done on CivitAI's servers (GPU not needed locally).",
             "url": "https://civitai.com/models/train",
         }
+
+
+    # ── Vault (cloud model storage for Supporter+) ──
+
+    def _trpc_query(self, procedure, input_data=None):
+        """Call CivitAI tRPC query endpoint."""
+        if not self.api_key:
+            raise ValueError("CivitAI API Key が必要です (Vault にはログインが必要)")
+        url = f"https://civitai.com/api/trpc/{procedure}"
+        if input_data is not None:
+            input_json = json.dumps({"json": input_data})
+            url += f"?input={urllib.parse.quote(input_json)}"
+        req = urllib.request.Request(url, headers=self._headers())
+        resp = urllib.request.urlopen(req, timeout=30)
+        data = json.loads(resp.read())
+        return data.get("result", {}).get("data", {}).get("json", data)
+
+    def _trpc_mutation(self, procedure, input_data):
+        """Call CivitAI tRPC mutation endpoint."""
+        if not self.api_key:
+            raise ValueError("CivitAI API Key が必要です")
+        url = f"https://civitai.com/api/trpc/{procedure}"
+        body = json.dumps({"json": input_data}).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body,
+            headers=self._headers(content_type="application/json"),
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=30)
+        data = json.loads(resp.read())
+        return data.get("result", {}).get("data", {}).get("json", data)
+
+    def vault_get(self):
+        """Get vault info (storage used, limit, etc.)."""
+        return self._trpc_query("vault.get")
+
+    def vault_list(self, limit=60, query="", page=1):
+        """List items in vault with optional search."""
+        params = {"limit": limit, "page": page}
+        if query:
+            params["query"] = query
+        return self._trpc_query("vault.getItemsPaged", params)
+
+    def vault_add(self, model_version_id):
+        """Add a model version to vault."""
+        return self._trpc_mutation("vault.toggleModelVersion", {"modelVersionId": model_version_id})
+
+    def vault_remove(self, model_version_ids):
+        """Remove model versions from vault."""
+        return self._trpc_mutation("vault.removeItemsFromVault", {"modelVersionIds": model_version_ids})
+
+    def vault_download_url(self, vault_item):
+        """Extract download URL from a vault item's files list."""
+        files = vault_item.get("files", [])
+        if files:
+            return files[0].get("url", "")
+        return ""
+
+    # ── iCloud model URN resolution ──
+
+    def resolve_icloud_model_urn(self, filename):
+        """Resolve an iCloud model filename to a CivitAI URN.
+
+        Searches CivitAI by filename, matches exactly, caches the result.
+        Returns dict with urn, base, type, name, version, cost or None.
+        """
+        global _urn_cache
+        if filename in _urn_cache:
+            return _urn_cache[filename]
+
+        # Build search queries from filename (strip extension, try variants)
+        base_name = filename.rsplit(".", 1)[0]
+        # Remove common suffixes for better search
+        search_queries = [base_name]
+        # Try shorter variants (e.g., "realismIllustriousBy_v55FP16" → "realismIllustrious")
+        for sep in ["_v", "_V", "-v", "-V", "FP16", "FP32", "fp16", "fp32"]:
+            if sep in base_name:
+                shorter = base_name.split(sep)[0]
+                if len(shorter) >= 4:
+                    search_queries.append(shorter)
+
+        for query in search_queries:
+            try:
+                results = self.search_models(query=query, limit=20)
+                items = results.get("items", [])
+                for model in items:
+                    for version in model.get("modelVersions", []):
+                        for file_info in version.get("files", []):
+                            if file_info.get("name") == filename:
+                                # Exact filename match found
+                                model_id = model["id"]
+                                version_id = version["id"]
+                                raw_base = version.get("baseModel", "SDXL 1.0")
+                                urn_prefix = _base_model_to_urn_prefix(raw_base)
+                                api_base = _base_model_to_api_format(raw_base)
+                                model_type = model.get("type", "Checkpoint").lower()
+                                type_key = "lora" if "lora" in model_type else "checkpoint"
+                                urn = f"urn:air:{urn_prefix}:{type_key}:civitai:{model_id}@{version_id}"
+
+                                info = {
+                                    "urn": urn,
+                                    "base": api_base,
+                                    "type": model.get("type", "Checkpoint"),
+                                    "name": model.get("name", base_name),
+                                    "version": version.get("name", ""),
+                                    "cost": "~4 Buzz" if api_base == "SDXL" else "~1 Buzz",
+                                }
+                                _urn_cache[filename] = info
+                                _save_urn_cache()
+                                return info
+            except Exception:
+                continue
+
+        # Not found - cache as None to avoid repeated lookups
+        _urn_cache[filename] = None
+        _save_urn_cache()
+        return None
+
+    def clear_urn_cache(self, filename=None):
+        """Clear URN cache. If filename given, clear only that entry."""
+        global _urn_cache
+        if filename:
+            _urn_cache.pop(filename, None)
+        else:
+            _urn_cache.clear()
+        _save_urn_cache()
 
 
 def format_model_result(model):

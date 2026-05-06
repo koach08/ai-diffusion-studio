@@ -46,8 +46,13 @@ DEZGO_IMAGE_MODELS = {
 }
 
 DEZGO_VIDEO_MODELS = {
-    "Wan 2.2 (高品質動画)": {
-        "endpoint": "/text2video_wan",
+    "Wan 2.6 (最新・高品質動画)": {
+        "endpoint": "/text2video_wan_2_6",
+        "defaults": {"steps": 30, "width": 832, "height": 480},
+        "cost": "~$0.10/本",
+    },
+    "Wan 2.1 (安定版動画)": {
+        "endpoint": "/text2video_wan_2_1",
         "defaults": {"steps": 30, "width": 832, "height": 480},
         "cost": "~$0.10/本",
     },
@@ -108,6 +113,46 @@ class DezgoClient:
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Dezgo API Error ({e.code}): {error_body}")
+
+    def img2img(self, prompt, image_path, negative_prompt="",
+                strength=0.7, model="realistic_vision_5", steps=30, guidance=7,
+                width=512, height=768, seed=-1):
+        """img2img via Dezgo. Fully uncensored. Returns raw PNG bytes."""
+        if not self.api_key:
+            raise ValueError("Dezgo API Key が設定されていません")
+
+        import base64
+        with open(image_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        data = {
+            "prompt": prompt,
+            "init_image": f"data:image/png;base64,{img_b64}",
+            "model": model,
+            "strength": strength,
+            "steps": steps,
+            "guidance": guidance,
+        }
+        if negative_prompt:
+            data["negative_prompt"] = negative_prompt
+        if seed >= 0:
+            data["seed"] = seed
+
+        body = json.dumps(data).encode("utf-8")
+        req = urllib.request.Request(
+            f"{DEZGO_API_URL}/image2image",
+            data=body,
+            headers={
+                "X-Dezgo-Key": self.api_key,
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=120)
+            return resp.read()  # raw PNG bytes
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Dezgo img2img Error ({e.code}): {error_body}")
 
     def generate_video(self, model_key, prompt, negative_prompt="",
                        width=832, height=480, steps=None, seed=-1):

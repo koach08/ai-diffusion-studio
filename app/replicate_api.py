@@ -38,7 +38,7 @@ MODELS = {
 # Video models
 VIDEO_MODELS = {
     "Wan 2.1 (高品質・推奨)": {
-        "model": "wan-ai/wan-2.1-t2v-480p",
+        "model": "wavespeedai/wan-2.1-t2v-480p",
         "defaults": {},
         "cost_per_video": "~$0.35",
     },

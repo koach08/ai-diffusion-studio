@@ -142,6 +142,74 @@ class NovitaClient:
             time.sleep(2)
         raise TimeoutError(f"生成が{timeout}秒以内に完了しませんでした")
 
+    def img2img(self, model_key, prompt, image_path, negative_prompt="",
+                strength=0.7, width=None, height=None, steps=None, guidance=None,
+                seed=-1):
+        """img2img via Novita.ai. Fully uncensored. Returns list of image URLs."""
+        import base64
+        model_info = NOVITA_MODELS.get(model_key)
+        if not model_info:
+            # Default to Realistic Vision for img2img
+            model_info = NOVITA_MODELS.get("Realistic Vision (フォトリアル)", list(NOVITA_MODELS.values())[0])
+
+        model_name = model_info["model"]
+        defaults = model_info["defaults"]
+        is_flux = "flux" in model_name.lower()
+
+        # Read and encode image
+        with open(image_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        if is_flux:
+            # Flux img2img
+            data = {
+                "model_name": model_name,
+                "prompt": prompt,
+                "image_url": f"data:image/png;base64,{img_b64}",
+                "strength": strength,
+                "width": width or defaults.get("width", 1024),
+                "height": height or defaults.get("height", 1024),
+                "image_num": 1,
+            }
+            if steps:
+                data["steps"] = steps
+            elif "steps" in defaults:
+                data["steps"] = defaults["steps"]
+            if guidance:
+                data["guidance_scale"] = guidance
+            elif "guidance_scale" in defaults:
+                data["guidance_scale"] = defaults["guidance_scale"]
+            if seed >= 0:
+                data["seed"] = seed
+            if negative_prompt:
+                data["negative_prompt"] = negative_prompt
+
+            result = self._request("POST", "/async/flux-img2img", data)
+        else:
+            # SD img2img — fully uncensored
+            data = {
+                "model_name": model_name,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt or "(worst quality, low quality:1.3)",
+                "init_imgs": [img_b64],
+                "denoising_strength": strength,
+                "width": width or defaults.get("width", 512),
+                "height": height or defaults.get("height", 768),
+                "image_num": 1,
+                "steps": steps or defaults.get("steps", 25),
+                "guidance_scale": guidance or defaults.get("guidance_scale", 7),
+                "enable_nsfw_detection": False,
+            }
+            if seed >= 0:
+                data["seed"] = seed
+
+            result = self._request("POST", "/async/img2img", data)
+
+        task_id = result.get("task_id", "")
+        if not task_id:
+            raise RuntimeError("タスクIDが取得できませんでした")
+        return self._poll_task(task_id)
+
     def check_api_key(self):
         try:
             self._request("GET", "/async/task-result?task_id=test")

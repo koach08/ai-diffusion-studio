@@ -241,11 +241,11 @@ Volume に保存されるので、Pod 停止→再起動しても消えない。
 - [x] RunPod GPU自動フォールバック + 空きGPU確認
 - [x] RunPodノンブロッキング起動
 - [ ] クイック質問ボタンが model_override を渡すよう修正済み（要テスト）
-- [ ] Prompt Templates（guide.py）を Quick/Adult タブに直接反映するボタン
+- [x] Prompt Templates（guide.py）を Quick/Adult タブに直接反映するボタン
 - [ ] バッチ生成・バッチアップロード機能
 - [ ] 生成履歴・ギャラリー管理
 - [ ] ComfyUI ワークフロー保存/ロード機能
-- [ ] FaceDetailer ワークフロー統合（Impact Pack インストール済み）
+- [x] FaceDetailer ワークフロー統合（Impact Pack + Subpack + face_yolov8m + SAM）
 
 ---
 

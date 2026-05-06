@@ -24,6 +24,7 @@ DEFAULT_CONFIG = {
     "output_dir_normal": os.path.join(BASE_DIR, "outputs", "normal"),
     "output_dir_adult": os.path.join(BASE_DIR, "outputs", "adult"),
     "google_drive_models_dir": "",
+    "icloud_models_dir": "",
     "default_model_normal": "",
     "default_model_adult": "",
     "default_negative_prompt": "worst quality, low quality, blurry, deformed, ugly, bad anatomy, bad hands, extra fingers, missing fingers",
@@ -90,32 +91,49 @@ def _gdrive_dir():
     return cfg.get("google_drive_models_dir", "")
 
 
+def _icloud_dir():
+    """Get iCloud models dir from saved config."""
+    cfg = {}
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+    return cfg.get("icloud_models_dir", "")
+
+
 def get_available_models(models_dir):
-    """Scan checkpoints directory for available models (local + Google Drive)."""
+    """Scan checkpoints directory for available models (local + Google Drive + iCloud)."""
     gdrive = _gdrive_dir()
+    icloud = _icloud_dir()
     dirs = [
         os.path.join(models_dir, "checkpoints"),
         os.path.join(gdrive, "checkpoints") if gdrive else "",
+        # iCloud: scan both checkpoints/ subfolder and root (flat structure)
+        os.path.join(icloud, "checkpoints") if icloud else "",
+        icloud if icloud else "",
     ]
     return _scan_dirs(dirs, (".safetensors", ".ckpt", ".pt"))
 
 
 def get_available_loras(models_dir):
-    """Scan loras directory (local + Google Drive)."""
+    """Scan loras directory (local + Google Drive + iCloud)."""
     gdrive = _gdrive_dir()
+    icloud = _icloud_dir()
     dirs = [
         os.path.join(models_dir, "loras"),
         os.path.join(gdrive, "loras") if gdrive else "",
+        os.path.join(icloud, "loras") if icloud else "",
     ]
     return _scan_dirs(dirs, (".safetensors", ".ckpt", ".pt"))
 
 
 def get_available_vaes(models_dir):
-    """Scan VAE directory (local + Google Drive)."""
+    """Scan VAE directory (local + Google Drive + iCloud)."""
     gdrive = _gdrive_dir()
+    icloud = _icloud_dir()
     dirs = [
         os.path.join(models_dir, "vae"),
         os.path.join(gdrive, "vae") if gdrive else "",
+        os.path.join(icloud, "vae") if icloud else "",
     ]
     return _scan_dirs(dirs, (".safetensors", ".ckpt", ".pt"))
 
@@ -164,6 +182,18 @@ def get_available_upscale_models(models_dir):
         if os.path.isdir(d):
             found.extend([f for f in os.listdir(d) if f.lower().endswith(exts)])
     return sorted(set(found))
+
+
+def get_icloud_only_models():
+    """Get checkpoint models ONLY from iCloud directory (not local or Google Drive)."""
+    icloud = _icloud_dir()
+    if not icloud:
+        return []
+    dirs = [
+        os.path.join(icloud, "checkpoints"),
+        icloud,  # flat structure (files directly in iCloud root)
+    ]
+    return _scan_dirs(dirs, (".safetensors", ".ckpt", ".pt"))
 
 
 def get_available_motion_models():

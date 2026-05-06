@@ -1,5 +1,8 @@
 """AI-diffusion Studio - Custom UI with ComfyUI backend."""
+import base64
 import datetime
+import io
+import json
 import logging
 import os
 import shutil
@@ -17,26 +20,163 @@ from PIL import Image
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "error.log")
 logging.basicConfig(
     filename=LOG_FILE,
-    level=logging.ERROR,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("ai-diffusion")
 
-from config import load_config, save_config, get_available_models, get_available_loras, get_available_vaes, get_available_motion_models, get_available_upscale_models, get_available_unet_models, get_available_clip_models, SAMPLERS, SCHEDULERS
-from comfyui_api import ComfyUIClient, build_txt2img_workflow, build_animatediff_workflow, build_img2vid_workflow, build_vid2vid_workflow, build_flux_workflow
+from config import load_config, save_config, get_available_models, get_available_loras, get_available_vaes, get_available_motion_models, get_available_upscale_models, get_available_unet_models, get_available_clip_models, get_icloud_only_models, SAMPLERS, SCHEDULERS
+from comfyui_api import (
+    ComfyUIClient, build_txt2img_workflow, build_img2img_workflow, build_refine_workflow,
+    build_inpaint_workflow, build_animatediff_workflow, build_img2vid_workflow,
+    build_vid2vid_workflow, build_flux_workflow, build_controlnet_workflow,
+    build_ipadapter_workflow,
+    build_wan22_t2v_workflow, build_wan22_i2v_workflow, WAN22_DEFAULTS,
+)
 from runpod_manager import RunPodManager, format_pod_status, format_pod_cost
+from vast_ai_manager import (VastAIManager, RECOMMENDED_MODELS as VAST_MODELS,
+                              STARTER_PACK, FULL_PACK, COMFYUI_IMAGES,
+                              format_instance_status, format_cost_summary)
 from replicate_api import ReplicateClient, MODELS as REPLICATE_MODELS, VIDEO_MODELS as REPLICATE_VIDEO_MODELS, download_url_to_pil
 from civitai_api import CivitAIClient, format_search_results, CIVITAI_GENERATION_MODELS
-from fal_api import FalClient, FAL_MODELS, FAL_VIDEO_MODELS, download_fal_image
+from fal_api import (FalClient, FAL_MODELS, FAL_VIDEO_MODELS, FAL_IMG2VID_MODELS, FAL_VID2VID_MODELS,
+                      STYLE_PRESETS, CONTROLNET_TYPES, ART_PRESETS, NSFW_PRESETS,
+                      NSFW_VIDEO_PRESETS, HQ_DEFAULTS,
+                      download_fal_image, download_fal_video)
 from together_api import TogetherClient, TOGETHER_MODELS, decode_together_image
 from dezgo_api import DezgoClient, DEZGO_IMAGE_MODELS, DEZGO_VIDEO_MODELS, decode_dezgo_image
 from novita_api import NovitaClient, NOVITA_MODELS, download_novita_image
 from guide import GUIDE_SECTIONS, PROMPT_TEMPLATES
 from ai_assistant import chat_with_ai, QUICK_QUESTIONS, PROVIDERS
+from adult_studio import (
+    CHAR_ETHNICITY, CHAR_AGE, CHAR_BODY_TYPE, CHAR_BREAST, CHAR_BUTT,
+    CHAR_HAIR_COLOR, CHAR_HAIR_STYLE, CHAR_SKIN, CHAR_EXPRESSION,
+    CHAR_CLOTHING, CHAR_POSE, SEX_POSITIONS, CHAR_CAMERA, CHAR_SETTING,
+    CHAR_STYLE, CHAR_PEOPLE_COUNT, SCENE_CATEGORIES, UNDRESS_MODES,
+    ADULT_VIDEO_SCENES,
+    ADULT_LORA_CATEGORIES, MODEL_OPTIMAL_SETTINGS,
+    QUALITY_PRESETS, get_quality_preset, apply_quality_to_params,
+    compose_character_prompt, compose_scene_prompt, compose_video_prompt,
+    get_undress_params, filter_loras_by_category, get_model_settings,
+)
 
 config = load_config()
+
+# ── Cinema Camera Presets ──
+CINEMA_PRESETS = {
+    "(なし)": "",
+    "Cinematic Blockbuster": ", shot on ARRI Alexa 35, Cooke S7/i 50mm T2.0, shallow depth of field, anamorphic lens flare, 2.39:1 cinematic framing",
+    "Indie / A24": ", shot on ARRI AMIRA, Zeiss Super Speed 35mm T1.3, natural lighting, 16mm film grain, muted desaturated palette, handheld camera",
+    "Vintage 70s": ", shot on Panavision Panaflex, anamorphic C-Series lenses, heavy halation, warm color cast, film grain, soft focus edges",
+    "Music Video / Fashion": ", shot on RED V-Raptor 8K, Sigma Cine 85mm T1.5, extreme shallow DOF, high contrast, teal and orange grade, slow motion",
+    "Documentary": ", shot on Sony FX6, Sony 24-70mm f/2.8 GM, available light, slight camera shake, realistic skin tones, broadcast look",
+    "Horror / Thriller": ", shot on RED Monstro 8K, Leica Summilux-C 29mm T1.4, dutch angle, underexposed, desaturated, green-tinted shadows, wide-angle distortion",
+    "Wes Anderson": ", shot on ARRI Alexa Mini, Zeiss Master Prime 40mm T1.3, perfectly symmetrical composition, pastel color palette, flat lighting, centered framing",
+    "IMAX Epic": ", shot on ARRI Alexa 65, Hasselblad Prime 65 50mm, IMAX aspect ratio, extreme resolution, vast depth of field f/8, sweeping crane shot",
+    "Neon Noir / Cyberpunk": ", shot on Blackmagic URSA Mini Pro 12K, Sigma Art 35mm f/1.4, neon reflections on wet pavement, high contrast, deep blacks, cyan and magenta grade",
+    "Dreamy / Ethereal": ", shot on Canon C500 Mark II, Canon CN-E 85mm T1.3, Pro-Mist diffusion filter, golden hour backlighting, lens flare, warm highlights, soft skin",
+    "Tarantino": ", shot on 35mm film, Panavision Ultra Speed 40mm T1.1, trunk shot POV, low angle, saturated reds, 1970s exploitation film aesthetic, visible film scratches",
+    "Spielberg Classic": ", shot on Panavision Millennium XL2, anamorphic G-Series, lens flare, magic hour lighting, 2.39:1 widescreen, dolly zoom",
+    "Drone / Aerial": ", shot on DJI Inspire 3, Zenmuse X9 24mm, aerial establishing shot, golden hour, sweeping orbital movement, vast landscape, tilt-shift",
+    "Found Footage / CCTV": ", shot on low-resolution CCTV camera, wide-angle fisheye lens, infrared night vision, timestamp overlay, VHS tracking lines, high ISO noise",
+    "Anime Cinematic": ", anime feature film quality, Makoto Shinkai style lighting, detailed backgrounds, volumetric light rays, 2.39:1 cinematic letterbox, vibrant color palette",
+}
+
+# ── Color Grading Presets (Pillow-based) ──
+COLOR_GRADE_PRESETS = {
+    "(なし)": {},
+    "Teal & Orange": {"contrast": 1.15, "saturation": 1.3, "brightness": 1.0},
+    "Vintage Warm": {"contrast": 1.1, "brightness": 1.05, "saturation": 0.9, "sepia": 0.25},
+    "Film Noir": {"contrast": 1.4, "brightness": 0.9, "saturation": 0.0},
+    "Cold Blue": {"contrast": 1.05, "brightness": 1.05, "saturation": 0.8, "hue_shift": 15},
+    "Golden Hour": {"contrast": 1.05, "brightness": 1.1, "saturation": 1.3, "sepia": 0.15},
+    "Bleach Bypass": {"contrast": 1.5, "brightness": 0.95, "saturation": 0.4},
+    "Neon Glow": {"contrast": 1.2, "brightness": 1.1, "saturation": 1.8},
+    "Moody Dark": {"contrast": 1.3, "brightness": 0.85, "saturation": 0.7, "sepia": 0.1},
+    "Pastel Dream": {"contrast": 0.9, "brightness": 1.15, "saturation": 0.6},
+    "Matte Film": {"contrast": 0.95, "brightness": 1.08, "saturation": 0.85, "sepia": 0.08},
+    "High Contrast B&W": {"contrast": 1.8, "brightness": 0.95, "saturation": 0.0},
+    "Retro Fade": {"contrast": 0.95, "brightness": 1.1, "saturation": 0.7, "sepia": 0.35},
+    "Cross Process": {"contrast": 1.15, "brightness": 1.05, "saturation": 1.4, "hue_shift": 25},
+}
+
+
+def apply_color_grade(pil_image, grade_name):
+    """Apply color grading to a PIL Image using ImageEnhance."""
+    from PIL import ImageEnhance, ImageFilter
+    import numpy as np
+
+    if grade_name == "(なし)" or grade_name not in COLOR_GRADE_PRESETS:
+        return pil_image
+
+    params = COLOR_GRADE_PRESETS[grade_name]
+    img = pil_image.copy()
+
+    # Saturation (0.0 = grayscale)
+    if "saturation" in params:
+        img = ImageEnhance.Color(img).enhance(params["saturation"])
+
+    # Contrast
+    if "contrast" in params:
+        img = ImageEnhance.Contrast(img).enhance(params["contrast"])
+
+    # Brightness
+    if "brightness" in params:
+        img = ImageEnhance.Brightness(img).enhance(params["brightness"])
+
+    # Sepia tone
+    if params.get("sepia", 0) > 0:
+        arr = np.array(img, dtype=np.float32)
+        sepia_matrix = np.array([
+            [0.393, 0.769, 0.189],
+            [0.349, 0.686, 0.168],
+            [0.272, 0.534, 0.131],
+        ])
+        sepia_arr = arr[:, :, :3] @ sepia_matrix.T
+        sepia_arr = np.clip(sepia_arr, 0, 255)
+        strength = params["sepia"]
+        blended = (1 - strength) * arr[:, :, :3] + strength * sepia_arr
+        arr[:, :, :3] = np.clip(blended, 0, 255)
+        img = Image.fromarray(arr.astype(np.uint8))
+
+    return img
+
+
+# ── Session save/restore ──
+SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session.json")
+
+def save_session(data):
+    """Save current work state to session file."""
+    try:
+        with open(SESSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        logger.error(f"Session save error: {e}")
+        return False
+
+def load_session():
+    """Load saved session state."""
+    try:
+        if os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"Session load error: {e}")
+    return {}
+
+def shutdown_app():
+    """Shutdown ComfyUI and Gradio safely."""
+    import signal
+    try:
+        subprocess.run(["bash", "-c", "lsof -ti:8188 | xargs kill 2>/dev/null"], timeout=5)
+    except Exception:
+        pass
+    os.kill(os.getpid(), signal.SIGTERM)
+
 client = ComfyUIClient(config["comfyui_url"])
 runpod = RunPodManager(config.get("runpod_api_key", ""))
+vastai = VastAIManager(config.get("vast_api_key", ""))
 civitai = CivitAIClient(config.get("civitai_api_key", ""))
 replicate = ReplicateClient(config.get("replicate_api_key", ""))
 fal = FalClient(config.get("fal_api_key", ""))
@@ -48,12 +188,45 @@ novita = NovitaClient(config.get("novita_api_key", ""))
 # Helpers
 # ──────────────────────────────────────────────
 
+def _get_models_for_backend():
+    """Get model list: from ComfyUI API for vast/local+running, else local scan."""
+    backend = config.get("backend", "local")
+    if backend in ("vast", "local", "runpod"):
+        try:
+            remote = client.get_models()
+            if remote:
+                return remote
+        except Exception:
+            pass
+    return get_available_models(config["models_dir"])
+
+
+def _build_model_choices(models=None):
+    """Build full model choices list based on current backend (with iCloud support)."""
+    if models is None:
+        models = _get_models_for_backend()
+    backend = config.get("backend", "local")
+    civitai_names = list(CIVITAI_GENERATION_MODELS.keys())
+
+    if backend == "civitai":
+        icloud_models = get_icloud_only_models()
+        icloud_set = set(icloud_models)
+        models = [m for m in models if m not in icloud_set]
+        icloud_prefixed = [f"[iCloud] {m}" for m in icloud_models]
+        return models + civitai_names + icloud_prefixed
+    elif backend == "fal":
+        fal_names = list(FAL_MODELS.keys())
+        return models + fal_names + civitai_names
+    else:
+        return models + civitai_names
+
+
 def refresh_models():
-    models = get_available_models(config["models_dir"])
+    all_models = _build_model_choices()
     loras = ["None"] + get_available_loras(config["models_dir"])
     vaes = ["None"] + get_available_vaes(config["models_dir"])
     return (
-        gr.update(choices=models, value=models[0] if models else None),
+        gr.update(choices=all_models, value=all_models[0] if all_models else None),
         gr.update(choices=loras, value="None"),
         gr.update(choices=vaes, value="None"),
     )
@@ -61,11 +234,11 @@ def refresh_models():
 
 def refresh_all_model_dropdowns():
     """Refresh model/lora/vae dropdowns across ALL tabs after a download."""
-    models = get_available_models(config["models_dir"])
+    all_models = _build_model_choices()
     loras = ["None"] + get_available_loras(config["models_dir"])
     vaes = ["None"] + get_available_vaes(config["models_dir"])
     motion = get_available_motion_models()
-    m = gr.update(choices=models)
+    m = gr.update(choices=all_models)
     l = gr.update(choices=loras)
     v = gr.update(choices=vaes)
     mm = gr.update(choices=motion)
@@ -98,6 +271,11 @@ def check_server_status():
         if civitai.api_key:
             return "🟢 CivitAI Generation: Ready (NSFW OK・全モデル使える・在庫切れなし)"
         return "🔴 CivitAI API Key が未設定 — Settingsタブで設定してください"
+    if backend == "vast":
+        # vast.ai: check remote ComfyUI via configured URL
+        if client.is_server_running():
+            return f"🟢 vast.ai ComfyUI: Running ({config.get('vast_comfyui_url', config['comfyui_url'])})"
+        return "🔴 vast.ai ComfyUI: Not Reachable — トンネルが切れている可能性。Settings確認"
     if client.is_server_running():
         label = "Local" if backend == "local" else "RunPod Cloud"
         status_line = f"🟢 ComfyUI Server: Running ({label})"
@@ -126,6 +304,64 @@ def check_server_status():
     return "🔴 ComfyUI Server: Not Running — launch.commandで起動してください"
 
 
+def _gradio_safe_video(video_path):
+    """Copy video to temp dir so Gradio can serve it (bypasses allowed_paths restrictions)."""
+    import tempfile
+    if not video_path or not os.path.exists(video_path):
+        return video_path
+    tmp = os.path.join(tempfile.gettempdir(), os.path.basename(video_path))
+    shutil.copy2(video_path, tmp)
+    return tmp
+
+
+def _resolve_lora_to_url(lora_name: str) -> str | None:
+    """Convert a local LoRA filename to a CivitAI download URL for cloud backends.
+
+    Strategy:
+    1. Search CivitAI for the filename
+    2. Return the download URL if found
+    3. Return None if not found (skip LoRA)
+    """
+    if not lora_name or lora_name == "None":
+        return None
+
+    # Strip .safetensors extension for search
+    search_name = lora_name.replace(".safetensors", "").replace(".ckpt", "")
+
+    try:
+        if civitai.api_key:
+            # Search CivitAI for this model
+            results = civitai._get("/models", {
+                "query": search_name,
+                "types": "LORA",
+                "limit": "5",
+                "sort": "Most Downloaded",
+            })
+            for model in results.get("items", []):
+                versions = model.get("modelVersions", [])
+                for version in versions:
+                    for f in version.get("files", []):
+                        if f.get("name", "").lower() == lora_name.lower():
+                            url = f.get("downloadUrl", "")
+                            if url and civitai.api_key:
+                                url += f"?token={civitai.api_key}"
+                            return url
+
+            # If exact match not found, try the first result's latest version
+            if results.get("items"):
+                first = results["items"][0]
+                versions = first.get("modelVersions", [])
+                if versions:
+                    download_url = versions[0].get("downloadUrl", "")
+                    if download_url and civitai.api_key:
+                        download_url += f"?token={civitai.api_key}"
+                    return download_url
+    except Exception as e:
+        logger.warning(f"CivitAI LoRA search failed for '{lora_name}': {e}")
+
+    return None
+
+
 def save_image_to_dir(image, output_dir, prefix="img"):
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -138,51 +374,75 @@ def save_image_to_dir(image, output_dir, prefix="img"):
 def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
                    width, height, steps, cfg, sampler, scheduler, seed,
                    batch_size, hires_fix=False, hires_scale=1.5, hires_denoise=0.5,
-                   hires_steps=15, upscale_model="", mode="normal"):
+                   hires_steps=15, upscale_model="", mode="normal",
+                   face_detailer=False, face_denoise=0.4, face_guide_size=512):
     """Generate image - routes to CivitAI / Replicate API / ComfyUI based on backend."""
     backend = config.get("backend", "local")
 
     # ── fal.ai backend: Flux quality, NSFW OK ──
     if backend == "fal":
-        if not fal.api_key:
-            raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
-        if not prompt.strip():
-            raise gr.Error("プロンプトを入力してください。")
-
-        w, h = int(width), int(height)
-        w = max(256, (w // 32) * 32)
-        h = max(256, (h // 32) * 32)
-        # Use selected model if it's a fal model, otherwise default
-        if model and model in FAL_MODELS:
-            model_key = model
+        # CivitAIモデル or iCloudモデルが選ばれた場合、CivitAIバックエンドに自動ルーティング
+        if model and (model in CIVITAI_GENERATION_MODELS or model.startswith("[iCloud] ")):
+            backend = "civitai"
+            # CivitAIの処理にフォールスルー
+        elif mode == "adult" and novita.api_key:
+            # Adult mode: prefer Novita.ai for fully uncensored CivitAI models
+            backend = "novita"
+            # Novitaの処理にフォールスルー
         else:
-            model_key = list(FAL_MODELS.keys())[0]
+            if not fal.api_key:
+                raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
+            if not prompt.strip():
+                raise gr.Error("プロンプトを入力してください。")
 
-        try:
-            urls = fal.generate_image(
-                model_key=model_key,
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                width=w, height=h,
-                num_images=int(batch_size),
-                seed=int(seed),
-                safety_checker=False,
-            )
+            w, h = int(width), int(height)
+            w = max(256, (w // 32) * 32)
+            h = max(256, (h // 32) * 32)
+            # Use selected model if it's a fal model, otherwise default
+            if model and model in FAL_MODELS:
+                model_key = model
+            else:
+                model_key = "Flux Dev (高品質・NSFW OK)"
+            # Adult mode: avoid Pro 1.1 (blocks NSFW with black image)
+            if mode == "adult" and not FAL_MODELS.get(model_key, {}).get("nsfw", True):
+                model_key = "Flux Dev (高品質・NSFW OK)"
 
-            images = []
-            saved_paths = []
-            output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
-            for url in urls:
-                img = download_fal_image(url)
-                images.append(img)
-                path = save_image_to_dir(img, output_dir, prefix=f"fal_{mode}")
-                saved_paths.append(path)
+            # Resolve LoRA: local filename → CivitAI download URL for fal.ai
+            lora_urls = None
+            if lora and lora != "None":
+                lora_url = _resolve_lora_to_url(lora)
+                if lora_url:
+                    lora_urls = [(lora_url, float(lora_strength))]
+                    model_key = "Flux + LoRA (カスタムLoRA・NSFW OK)"
+                    logger.info(f"fal.ai LoRA resolved: {lora} → {lora_url}")
 
-            cost = FAL_MODELS.get(model_key, {}).get("cost", "?")
-            return images, f"[fal.ai {model_key}] コスト: {cost}\n保存先: {', '.join(saved_paths)}"
-        except Exception as e:
-            logger.error(f"fal.ai生成エラー: {traceback.format_exc()}")
-            raise gr.Error(f"fal.ai生成エラー: {e}")
+            try:
+                urls = fal.generate_image(
+                    model_key=model_key,
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    width=w, height=h,
+                    num_images=int(batch_size),
+                    seed=int(seed),
+                    safety_checker=False,
+                    lora_urls=lora_urls,
+                )
+
+                images = []
+                saved_paths = []
+                output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+                for url in urls:
+                    img = download_fal_image(url)
+                    images.append(img)
+                    path = save_image_to_dir(img, output_dir, prefix=f"fal_{mode}")
+                    saved_paths.append(path)
+
+                lora_label = f" + LoRA: {lora}" if lora_urls else ""
+                cost = FAL_MODELS.get(model_key, {}).get("cost", "?")
+                return images, f"[fal.ai {model_key}{lora_label}] コスト: {cost}\n保存先: {', '.join(saved_paths)}"
+            except Exception as e:
+                logger.error(f"fal.ai生成エラー: {traceback.format_exc()}")
+                raise gr.Error(f"fal.ai生成エラー: {e}")
 
     # ── Together.ai backend: Flux + NSFW OK ──
     if backend == "together":
@@ -269,7 +529,63 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
         if not prompt.strip():
             raise gr.Error("プロンプトを入力してください。")
 
-        # Pick model: use selected model name if it matches a CivitAI model, else auto
+        # ── LoRA URN解決 (CivitAIクラウドでLoRAを使うにはURNが必要) ──
+        lora_urns = None
+        if lora and lora not in ("None", ""):
+            lora_urn_info = civitai.resolve_icloud_model_urn(lora)
+            if lora_urn_info and "lora" in lora_urn_info.get("type", "").lower():
+                lora_urns = [(lora_urn_info["urn"], float(lora_strength))]
+                logger.info(f"CivitAI LoRA URN解決: {lora} → {lora_urn_info['urn']}")
+
+        # ── iCloudモデルが選ばれた場合: CivitAI APIでURNを解決してクラウド生成 ──
+        if model and model.startswith("[iCloud] "):
+            icloud_filename = model[len("[iCloud] "):]
+            logger.info(f"iCloudモデル選択: {icloud_filename} → CivitAI URN解決中...")
+            try:
+                urn_info = civitai.resolve_icloud_model_urn(icloud_filename)
+                if not urn_info:
+                    raise gr.Error(
+                        f"CivitAIでモデルが見つかりません: {icloud_filename}\n"
+                        "モデルがCivitAIに存在するか確認してください。"
+                    )
+                if urn_info.get("type", "").lower() == "lora":
+                    raise gr.Error(
+                        f"{icloud_filename} はLoRAです。Checkpointモデルとして使えません。\n"
+                        "LoRAドロップダウンから選択してください。"
+                    )
+
+                logger.info(f"URN解決成功: {urn_info['name']} → {urn_info['urn']}")
+                urls = civitai.generate_image_by_urn(
+                    model_urn=urn_info["urn"],
+                    base_model=urn_info["base"],
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    width=int(width), height=int(height),
+                    steps=int(steps), cfg_scale=float(cfg),
+                    seed=int(seed), quantity=int(batch_size),
+                    lora_urns=lora_urns,
+                )
+
+                images = []
+                saved_paths = []
+                output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+                for url in urls:
+                    img = download_url_to_pil(url)
+                    images.append(img)
+                    path = save_image_to_dir(img, output_dir, prefix=f"civitai_icloud_{mode}")
+                    saved_paths.append(path)
+
+                cost = urn_info.get("cost", "~4 Buzz")
+                model_label = f"{urn_info['name']} ({urn_info.get('version', '')})"
+                lora_label = f" + LoRA: {lora}" if lora_urns else ""
+                return images, f"[CivitAI iCloud: {model_label}{lora_label}] コスト: {cost}/枚\n保存先: {', '.join(saved_paths)}"
+            except gr.Error:
+                raise
+            except Exception as e:
+                logger.error(f"CivitAI iCloud生成エラー: {traceback.format_exc()}")
+                raise gr.Error(f"CivitAI iCloudモデル生成エラー: {e}")
+
+        # ── 既存のCivitAIクラウドモデル ──
         civitai_model_key = None
         if model and model in CIVITAI_GENERATION_MODELS:
             civitai_model_key = model
@@ -284,6 +600,7 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
                 width=int(width), height=int(height),
                 steps=int(steps), cfg_scale=float(cfg),
                 seed=int(seed), quantity=int(batch_size),
+                lora_urns=lora_urns,
             )
 
             images = []
@@ -296,7 +613,8 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
                 saved_paths.append(path)
 
             cost = CIVITAI_GENERATION_MODELS.get(civitai_model_key, {}).get("cost", "?")
-            return images, f"[CivitAI: {civitai_model_key}] コスト: {cost}/枚\n保存先: {', '.join(saved_paths)}"
+            lora_label = f" + LoRA: {lora}" if lora_urns else ""
+            return images, f"[CivitAI: {civitai_model_key}{lora_label}] コスト: {cost}/枚\n保存先: {', '.join(saved_paths)}"
         except Exception as e:
             logger.error(f"CivitAI生成エラー: {traceback.format_exc()}")
             raise gr.Error(f"CivitAI生成エラー: {e}")
@@ -345,12 +663,17 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
             logger.error(f"Replicate生成エラー: {traceback.format_exc()}")
             raise gr.Error(f"Replicate生成エラー: {e}")
 
-    # ── Local / RunPod backend: use ComfyUI ──
+    # ── Local / RunPod / vast.ai backend: use ComfyUI ──
     if not client.is_server_running():
+        backend_label = {
+            "vast": "vast.ai ComfyUI",
+            "runpod": "RunPod ComfyUI",
+            "local": "Local ComfyUI",
+        }.get(backend, "ComfyUI Server")
         raise gr.Error(
-            "ComfyUI Server が起動していません。\n"
-            "💡 Replicate バックエンドなら ComfyUI 不要で即生成できます。\n"
-            "Settings → Backend を 'replicate' に切り替えてください。"
+            f"{backend_label} に接続できません ({client.server_url})\n"
+            "💡 vast.ai: インスタンスとCloudflareトンネルが起動しているか確認\n"
+            "💡 または Settings → Backend を 'fal' / 'novita' / 'replicate' に切り替え"
         )
 
     if not model:
@@ -380,9 +703,12 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
         hires_denoise=hires_denoise,
         hires_steps=hires_steps,
         upscale_model=upscale_name,
+        face_detailer=face_detailer,
+        face_denoise=face_denoise,
+        face_guide_size=face_guide_size,
     )
 
-    timeout = 1200 if hires_fix else 900
+    timeout = 1200 if (hires_fix or face_detailer) else 900
     images = client.generate(workflow, timeout=timeout)
 
     output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
@@ -392,25 +718,202 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
         saved_paths.append(path)
 
     hires_info = f" [Hires Fix: {hires_scale}x, denoise={hires_denoise}]" if hires_fix else ""
-    return images, f"保存先: {', '.join(saved_paths)}{hires_info}"
+    face_info = f" [FaceDetailer: denoise={face_denoise}]" if face_detailer else ""
+    return images, f"保存先: {', '.join(saved_paths)}{hires_info}{face_info}"
 
 
 # ──────────────────────────────────────────────
 # Generate functions for each tab
 # ──────────────────────────────────────────────
 
+def _apply_cinema_and_grade(prompt, images, cinema_preset="(なし)", color_grade="(なし)"):
+    """Apply cinema preset to prompt and color grading to generated images."""
+    # Cinema preset: append suffix to prompt
+    final_prompt = prompt
+    if cinema_preset and cinema_preset != "(なし)" and cinema_preset in CINEMA_PRESETS:
+        final_prompt = prompt + CINEMA_PRESETS[cinema_preset]
+
+    # Color grading: apply Pillow filters to each image
+    if color_grade and color_grade != "(なし)" and images:
+        graded = []
+        for img in images:
+            if isinstance(img, Image.Image):
+                graded.append(apply_color_grade(img, color_grade))
+            else:
+                graded.append(img)
+        return final_prompt, graded
+    return final_prompt, images
+
+
 def generate_normal(prompt, neg, model, lora, lora_str, vae, w, h, steps, cfg, sampler, sched, seed, batch,
-                    hires_fix, hires_scale, hires_denoise, hires_steps, upscale_model):
-    images, info = generate_image(prompt, neg, model, lora, lora_str, vae, w, h, steps, cfg, sampler, sched, seed, batch,
-                                  hires_fix, hires_scale, hires_denoise, hires_steps, upscale_model, "normal")
-    return images, info
+                    hires_fix, hires_scale, hires_denoise, hires_steps, upscale_model,
+                    face_detailer=False, face_denoise=0.4, face_guide_size=512,
+                    cinema_preset="(なし)", color_grade="(なし)"):
+    final_prompt = prompt
+    if cinema_preset and cinema_preset != "(なし)" and cinema_preset in CINEMA_PRESETS:
+        final_prompt = prompt + CINEMA_PRESETS[cinema_preset]
+    images, info = generate_image(final_prompt, neg, model, lora, lora_str, vae, w, h, steps, cfg, sampler, sched, seed, batch,
+                                  hires_fix, hires_scale, hires_denoise, hires_steps, upscale_model, "normal",
+                                  face_detailer, face_denoise, face_guide_size)
+    if color_grade and color_grade != "(なし)" and images:
+        images = [apply_color_grade(img, color_grade) if isinstance(img, Image.Image) else img for img in images]
+    cinema_info = f" [Cinema: {cinema_preset}]" if cinema_preset != "(なし)" else ""
+    grade_info = f" [Grade: {color_grade}]" if color_grade != "(なし)" else ""
+    return images, info + cinema_info + grade_info
 
 
 def generate_adult(prompt, neg, model, lora, lora_str, vae, w, h, steps, cfg, sampler, sched, seed, batch,
-                   hires_fix, hires_scale, hires_denoise, hires_steps, upscale_model):
-    images, info = generate_image(prompt, neg, model, lora, lora_str, vae, w, h, steps, cfg, sampler, sched, seed, batch,
-                                  hires_fix, hires_scale, hires_denoise, hires_steps, upscale_model, "adult")
-    return images, info
+                   hires_fix, hires_scale, hires_denoise, hires_steps, upscale_model,
+                   face_detailer=False, face_denoise=0.4, face_guide_size=512,
+                   cinema_preset="(なし)", color_grade="(なし)"):
+    """Adult image generation with robust fallback chain.
+
+    Uses _adult_generate_image() → ComfyUI (vast.ai) → Novita → Dezgo → CivitAI → fal.ai.
+    Never fails hard on transient network issues.
+    """
+    if not prompt or not prompt.strip():
+        raise gr.Error("プロンプトを入力してください。")
+
+    final_prompt = prompt
+    if cinema_preset and cinema_preset != "(なし)" and cinema_preset in CINEMA_PRESETS:
+        final_prompt = prompt + CINEMA_PRESETS[cinema_preset]
+
+    # Resolve model override: (自動) or None → auto pick. Otherwise pass through.
+    model_override = model if model and model not in ("(自動)", "None", "") else None
+
+    # CivitAI cloud model or iCloud model selection routes via civitai_model argument
+    civitai_model = None
+    if model_override and (model_override in CIVITAI_GENERATION_MODELS or model_override.startswith("[iCloud] ")):
+        civitai_model = model_override
+        model_override = None
+
+    images, info = _adult_generate_image(
+        prompt=final_prompt,
+        negative=neg or config.get("default_negative_prompt", ""),
+        w=int(w), h=int(h),
+        seed=int(seed) if seed is not None else -1,
+        prefix="adult",
+        civitai_model=civitai_model,
+        model_override=model_override,
+        lora_override=lora,
+        lora_str=lora_str,
+        vae_override=vae,
+        steps_override=int(steps) if steps else None,
+        cfg_override=float(cfg) if cfg else None,
+        sampler_override=sampler,
+        scheduler_override=sched,
+        hires_fix=bool(hires_fix),
+        hires_scale=float(hires_scale) if hires_scale else 1.5,
+        hires_denoise=float(hires_denoise) if hires_denoise else 0.5,
+        hires_steps=int(hires_steps) if hires_steps else 15,
+        upscale_model=upscale_model if upscale_model and upscale_model != "None" else "",
+        face_detailer=bool(face_detailer),
+        face_denoise=float(face_denoise) if face_denoise else 0.4,
+        face_guide_size=int(face_guide_size) if face_guide_size else 512,
+    )
+
+    if color_grade and color_grade != "(なし)" and images:
+        images = [apply_color_grade(img, color_grade) if isinstance(img, Image.Image) else img for img in images]
+
+    cinema_info = f" [Cinema: {cinema_preset}]" if cinema_preset != "(なし)" else ""
+    grade_info = f" [Grade: {color_grade}]" if color_grade != "(なし)" else ""
+    return images, info + cinema_info + grade_info
+
+
+def refine_image(gallery_selection, prompt, negative, model, seed,
+                 denoise=0.35, upscale_scale=1.5, face_fix=True, mode="adult"):
+    """Refine a generated image: upscale + light denoise + face detailer.
+
+    Takes image from gallery, runs through refine pipeline, returns enhanced version.
+    """
+    from PIL import Image as PILImage
+    import numpy as np
+
+    # Extract image from gallery selection
+    if gallery_selection is None:
+        raise gr.Error("リファインする画像を選択してください。ギャラリーの画像をクリックして選択。")
+
+    # gallery_selection can be: filepath string, tuple (filepath, caption), or PIL Image
+    if isinstance(gallery_selection, (list, tuple)):
+        img_source = gallery_selection[0] if gallery_selection else None
+    else:
+        img_source = gallery_selection
+
+    if img_source is None:
+        raise gr.Error("画像が見つかりません。")
+
+    # Get image as PIL
+    if isinstance(img_source, str):
+        img = PILImage.open(img_source)
+    elif isinstance(img_source, np.ndarray):
+        img = PILImage.fromarray(img_source)
+    else:
+        img = img_source
+
+    output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+    os.makedirs(output_dir, exist_ok=True)
+    s = int(seed) if seed is not None and seed >= 0 else -1
+
+    # Save source image temporarily for ComfyUI
+    ts = int(time.time())
+    temp_path = os.path.join(output_dir, f"_refine_src_{ts}.png")
+    img.save(temp_path)
+
+    # Try ComfyUI refine workflow
+    if client.is_server_running():
+        try:
+            # Upload image to ComfyUI
+            img_name = client.upload_image(temp_path)
+            if not img_name:
+                img_name = os.path.basename(temp_path)
+
+            models = client.get_models()
+            if not models:
+                models = _get_models_for_backend()
+
+            chosen_model = model if model and model not in ("None", "(自動)", "") else (models[0] if models else None)
+            if not chosen_model:
+                raise gr.Error("モデルが見つかりません。")
+
+            neg = negative or "ugly, deformed, blurry, low quality, bad anatomy, extra fingers, watermark, text"
+
+            workflow = build_refine_workflow(
+                prompt=prompt or "high quality, detailed, sharp focus, professional photography",
+                negative_prompt=neg,
+                model=chosen_model,
+                image_path=img_name,
+                width=img.width,
+                height=img.height,
+                steps=25,
+                cfg=7.0,
+                denoise=float(denoise),
+                upscale_model="4x-UltraSharp.pth",
+                upscale_scale=float(upscale_scale),
+                face_detailer=bool(face_fix),
+                face_denoise=0.35,
+                face_guide_size=768,
+                seed=s,
+            )
+            result = client.generate(workflow, timeout=1800)
+            if result:
+                saved = []
+                for r_img in result:
+                    saved.append(save_image_to_dir(r_img, output_dir, prefix="refined"))
+                return result, f"[Refine完了] Upscale {upscale_scale}x + Denoise {denoise} + FaceDetailer\n保存先: {', '.join(saved)}"
+        except Exception as e:
+            # Clean up temp
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise gr.Error(f"リファイン失敗: {e}")
+    else:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise gr.Error("ComfyUIが起動していません。リファインにはComfyUIが必要です。")
+
+    # Clean up temp
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
+    return [img], "リファイン処理に失敗しました。"
 
 
 # ──────────────────────────────────────────────
@@ -447,8 +950,14 @@ def extract_last_frame(video_path):
 
 def generate_video_txt2vid(prompt, neg, model, motion_model, lora, lora_str, vae,
                            w, h, steps, cfg, sampler, sched, seed,
-                           frame_count, fps, output_format, mode="normal"):
-    """Generate video from text prompt - routes to cloud API or AnimateDiff."""
+                           frame_count, fps, output_format, mode="normal",
+                           cloud_model=None, duration=None):
+    """Generate video from text prompt - routes to cloud API or AnimateDiff.
+
+    Duration: seconds (cloud only). For local AnimateDiff, duration is derived
+    from frame_count/fps. If duration provided for local mode, frame_count is
+    recomputed as int(duration * fps).
+    """
     backend = config.get("backend", "local")
 
     # ── Cloud backends: use fal.ai for video ──
@@ -456,13 +965,23 @@ def generate_video_txt2vid(prompt, neg, model, motion_model, lora, lora_str, vae
         if not prompt.strip():
             raise gr.Error("プロンプトを入力してください。")
         if fal.api_key:
-            video_path, info = generate_fal_video(prompt, "LTX 2.3 (高速・安い)", mode)
-            return video_path, [], info
+            fal_model = cloud_model or "LTX 2.3 (高速・安い)"
+            dur = int(duration) if duration else None
+            video_path, info = generate_fal_video(
+                prompt, fal_model, mode, duration=dur,
+                width=int(w) if w else None, height=int(h) if h else None,
+                negative_prompt=neg, seed=int(seed) if seed is not None else -1,
+            )
+            return _gradio_safe_video(video_path), [], info
         else:
             raise gr.Error(
                 "動画生成には fal.ai API Key が必要です。\n"
                 "Settingsタブで設定してください。"
             )
+
+    # Local AnimateDiff: derive frames from duration if specified
+    if duration and duration > 0:
+        frame_count = int(float(duration) * float(fps))
 
     if not client.is_server_running():
         raise gr.Error(
@@ -503,13 +1022,36 @@ def generate_video_txt2vid(prompt, neg, model, motion_model, lora, lora_str, vae
     info = f"Frames: {len(frames)}"
     if video_path:
         info += f"\n保存先: {video_path}"
-    return video_path, frames[:4] if frames else [], info
+    return _gradio_safe_video(video_path), frames[:4] if frames else [], info
 
 
 def generate_video_img2vid(image, prompt, neg, model, motion_model, vae,
                            w, h, steps, cfg, sampler, sched, seed,
-                           frame_count, fps, denoise, output_format, mode="normal"):
-    """Generate video from input image using AnimateDiff img2vid."""
+                           frame_count, fps, denoise, output_format, mode="normal",
+                           cloud_model=None, duration=None):
+    """Generate video from input image using AnimateDiff img2vid or fal.ai cloud.
+
+    Duration: seconds (cloud only). For local AnimateDiff, derived from frame_count/fps.
+    If duration provided in local mode, frame_count is recomputed.
+    """
+    backend = config.get("backend", "local")
+
+    # ── Cloud backends: use fal.ai for img2vid ──
+    if backend != "local":
+        if image is None:
+            raise gr.Error("入力画像を選択してください。")
+        if fal.api_key:
+            fal_model = cloud_model or "Kling 2.5 Turbo Pro img2vid (高品質・SFW)"
+            dur = int(duration) if duration else None
+            video_path, info = generate_fal_img2vid(image, prompt, fal_model, mode, dur)
+            return _gradio_safe_video(video_path), [], info
+        else:
+            raise gr.Error("fal.ai API Key が必要です。Settingsタブで設定してください。")
+
+    # Local AnimateDiff: derive frames from duration if specified
+    if duration and duration > 0:
+        frame_count = int(float(duration) * float(fps))
+
     if not client.is_server_running():
         raise gr.Error("ComfyUI Server が起動していません。")
     if not model:
@@ -554,7 +1096,7 @@ def generate_video_img2vid(image, prompt, neg, model, motion_model, vae,
     info = f"Frames: {len(frames)}"
     if video_path:
         info += f"\n保存先: {video_path}"
-    return video_path, frames[:4] if frames else [], info
+    return _gradio_safe_video(video_path), frames[:4] if frames else [], info
 
 
 # Flux default model names (pre-configured for RunPod templates)
@@ -613,6 +1155,666 @@ def generate_flux(prompt, unet_model, clip_l, t5xxl, vae_name, lora, lora_streng
     return images, f"[Flux] 保存先: {', '.join(saved_paths)}"
 
 
+# ──────────────────────────────────────────────
+# New advanced features (ai-studio parity)
+# ──────────────────────────────────────────────
+
+def _upload_image_to_fal(image, output_dir, prefix="upload"):
+    """Helper: save image to temp file, upload to fal storage, return URL."""
+    import fal_client as fc
+    from PIL import Image as PILImage
+    os.environ["FAL_KEY"] = fal.api_key
+    os.makedirs(output_dir, exist_ok=True)
+    ts = int(time.time())
+    if isinstance(image, str):
+        img_path = image
+    else:
+        img_path = os.path.join(output_dir, f"{prefix}_{ts}.png")
+        PILImage.fromarray(image).save(img_path)
+    return fc.upload_file(img_path)
+
+
+def generate_style_transfer(image, style_key, custom_prompt, strength, mode="normal"):
+    """Apply style transfer to an image via fal.ai."""
+    if not fal.api_key:
+        raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
+    if image is None:
+        raise gr.Error("画像をアップロードしてください。")
+    try:
+        output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+        image_url = _upload_image_to_fal(image, output_dir, "style_input")
+        urls = fal.style_transfer(image_url, style_key, custom_prompt, strength)
+        if not urls:
+            raise RuntimeError("スタイル転送結果が取得できませんでした")
+        img = download_fal_image(urls[0])
+        save_path = save_image_to_dir(img, output_dir, prefix=f"style_{mode}")
+        style_name = style_key.split("(")[0].strip()
+        return img, f"[Style Transfer: {style_name}] strength={strength}\n保存先: {save_path}"
+    except Exception as e:
+        logger.error(f"スタイル転送エラー: {traceback.format_exc()}")
+        raise gr.Error(f"スタイル転送エラー: {e}")
+
+
+def generate_inpaint(image, mask, prompt, negative_prompt, width, height, steps, guidance, seed, mode="normal"):
+    """Inpaint image region via fal.ai."""
+    if not fal.api_key:
+        raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
+    if image is None:
+        raise gr.Error("画像をアップロードしてください。")
+    if mask is None:
+        raise gr.Error("マスク画像をアップロードしてください（白=編集エリア）。")
+    if not prompt.strip():
+        raise gr.Error("プロンプトを入力してください。")
+    try:
+        output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+        image_url = _upload_image_to_fal(image, output_dir, "inpaint_image")
+        mask_url = _upload_image_to_fal(mask, output_dir, "inpaint_mask")
+        urls = fal.inpaint(
+            image_url, mask_url, prompt, negative_prompt,
+            int(width), int(height), int(steps), float(guidance), int(seed)
+        )
+        if not urls:
+            raise RuntimeError("インペイント結果が取得できませんでした")
+        img = download_fal_image(urls[0])
+        save_path = save_image_to_dir(img, output_dir, prefix=f"inpaint_{mode}")
+        return img, f"[Inpaint] 完了\n保存先: {save_path}"
+    except Exception as e:
+        logger.error(f"インペイントエラー: {traceback.format_exc()}")
+        raise gr.Error(f"インペイントエラー: {e}")
+
+
+def generate_remove_bg(image, mode="normal"):
+    """Remove background via fal.ai."""
+    if not fal.api_key:
+        raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
+    if image is None:
+        raise gr.Error("画像をアップロードしてください。")
+    try:
+        output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+        image_url = _upload_image_to_fal(image, output_dir, "rmbg_input")
+        urls = fal.remove_background(image_url)
+        if not urls:
+            raise RuntimeError("背景除去結果が取得できませんでした")
+        img = download_fal_image(urls[0])
+        save_path = save_image_to_dir(img, output_dir, prefix=f"nobg_{mode}")
+        return img, f"[Background Removal] 完了\n保存先: {save_path}"
+    except Exception as e:
+        logger.error(f"背景除去エラー: {traceback.format_exc()}")
+        raise gr.Error(f"背景除去エラー: {e}")
+
+
+def generate_upscale(image, scale, mode="normal"):
+    """Upscale image via fal.ai."""
+    if not fal.api_key:
+        raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
+    if image is None:
+        raise gr.Error("画像をアップロードしてください。")
+    try:
+        output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+        image_url = _upload_image_to_fal(image, output_dir, "upscale_input")
+        urls = fal.upscale(image_url, int(scale))
+        if not urls:
+            raise RuntimeError("アップスケール結果が取得できませんでした")
+        img = download_fal_image(urls[0])
+        save_path = save_image_to_dir(img, output_dir, prefix=f"upscale_{scale}x_{mode}")
+        return img, f"[Upscale {scale}x] 完了\n保存先: {save_path}"
+    except Exception as e:
+        logger.error(f"アップスケールエラー: {traceback.format_exc()}")
+        raise gr.Error(f"アップスケールエラー: {e}")
+
+
+def generate_controlnet(control_image, prompt, negative_prompt, control_type,
+                        control_strength, width, height, steps, guidance, seed, mode="normal"):
+    """Generate image guided by ControlNet via fal.ai."""
+    if not fal.api_key:
+        raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
+    if control_image is None:
+        raise gr.Error("コントロール画像をアップロードしてください。")
+    if not prompt.strip():
+        raise gr.Error("プロンプトを入力してください。")
+    try:
+        output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+        control_url = _upload_image_to_fal(control_image, output_dir, "controlnet_input")
+        ct = CONTROLNET_TYPES.get(control_type, "canny")
+        urls = fal.controlnet(
+            control_url, prompt, ct, float(control_strength),
+            negative_prompt, int(width), int(height), int(steps), float(guidance), int(seed)
+        )
+        if not urls:
+            raise RuntimeError("ControlNet結果が取得できませんでした")
+        img = download_fal_image(urls[0])
+        save_path = save_image_to_dir(img, output_dir, prefix=f"controlnet_{mode}")
+        return img, f"[ControlNet: {control_type}] strength={control_strength}\n保存先: {save_path}"
+    except Exception as e:
+        logger.error(f"ControlNetエラー: {traceback.format_exc()}")
+        raise gr.Error(f"ControlNetエラー: {e}")
+
+
+def generate_vid2vid_cloud(video_file, prompt, model_key, strength, mode="normal"):
+    """Video-to-video style transfer via cloud API."""
+    if not fal.api_key:
+        raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
+    if video_file is None:
+        raise gr.Error("動画ファイルをアップロードしてください。")
+    if not prompt.strip():
+        raise gr.Error("プロンプトを入力してください。")
+    try:
+        import fal_client as fc
+        os.environ["FAL_KEY"] = fal.api_key
+        video_path = video_file if isinstance(video_file, str) else video_file.name
+        video_url = fc.upload_file(video_path)
+
+        result_url = fal.vid2vid(video_url, prompt, model_key, strength)
+        if not result_url:
+            raise RuntimeError("vid2vid結果が取得できませんでした")
+
+        output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+        os.makedirs(output_dir, exist_ok=True)
+        import datetime as dt
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(output_dir, f"vid2vid_cloud_{ts}.mp4")
+        download_fal_video(result_url, out_path)
+
+        cost = FAL_VID2VID_MODELS.get(model_key, {}).get("cost", "?")
+        return out_path, f"[vid2vid Cloud: {model_key}] コスト: {cost}\n保存先: {out_path}"
+    except Exception as e:
+        logger.error(f"vid2vid Cloudエラー: {traceback.format_exc()}")
+        raise gr.Error(f"vid2vid Cloudエラー: {e}")
+
+
+def generate_long_video(prompt, model_key, num_clips, duration_per_clip,
+                        negative_prompt="", mode="normal", progress=gr.Progress()):
+    """Generate a long video by auto-chaining multiple clips via img2vid."""
+    if not fal.api_key:
+        raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
+    if not prompt.strip():
+        raise gr.Error("プロンプトを入力してください。")
+
+    num_clips = int(num_clips)
+    dur = int(duration_per_clip)
+    if num_clips < 2:
+        raise gr.Error("2クリップ以上を指定してください。（1クリップなら通常の動画生成を使ってください）")
+    if num_clips > 10:
+        raise gr.Error("最大10クリップまでです。")
+
+    output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+    os.makedirs(output_dir, exist_ok=True)
+    clip_paths = []
+
+    try:
+        import fal_client as fc
+        os.environ["FAL_KEY"] = fal.api_key
+        import datetime as dt
+
+        # Step 1: Generate first clip via txt2vid
+        progress(0.0, desc=f"クリップ 1/{num_clips} を生成中...")
+        first_url = fal.generate_video(model_key, prompt,
+                                       negative_prompt=negative_prompt,
+                                       duration=dur)
+        if not first_url:
+            raise RuntimeError("最初のクリップの生成に失敗しました")
+
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        clip1_path = os.path.join(output_dir, f"longvid_clip01_{ts}.mp4")
+        download_fal_video(first_url, clip1_path)
+        clip_paths.append(clip1_path)
+
+        # Steps 2..N: Extract last frame → img2vid for continuation
+        for i in range(2, num_clips + 1):
+            progress((i - 1) / num_clips, desc=f"クリップ {i}/{num_clips} を生成中...")
+
+            # Extract last frame from previous clip
+            last_frame_img, _ = extract_last_frame(clip_paths[-1])
+            if last_frame_img is None:
+                raise RuntimeError(f"クリップ {i-1} から最終フレーム抽出に失敗しました")
+
+            # Save and upload last frame
+            frame_path = os.path.join(output_dir, f"longvid_frame{i:02d}_{ts}.png")
+            last_frame_img.save(frame_path)
+            frame_url = fc.upload_file(frame_path)
+
+            # Find matching img2vid model
+            img2vid_model = _find_matching_img2vid_model(model_key)
+
+            video_url = fal.img2vid(img2vid_model, frame_url,
+                                    prompt=prompt, duration=dur)
+            if not video_url:
+                raise RuntimeError(f"クリップ {i} の生成に失敗しました")
+
+            clip_path = os.path.join(output_dir, f"longvid_clip{i:02d}_{ts}.mp4")
+            download_fal_video(video_url, clip_path)
+            clip_paths.append(clip_path)
+
+        # Step final: Concatenate all clips with ffmpeg
+        progress(0.95, desc="クリップを結合中...")
+        concat_path = os.path.join(output_dir, f"longvid_final_{ts}.mp4")
+        concat_list_path = os.path.join(output_dir, f"longvid_list_{ts}.txt")
+
+        with open(concat_list_path, "w") as f:
+            for cp in clip_paths:
+                f.write(f"file '{cp}'\n")
+
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+             "-i", concat_list_path, "-c", "copy", concat_path],
+            capture_output=True, timeout=60,
+        )
+        if result.returncode != 0:
+            # Fallback: try re-encoding
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                 "-i", concat_list_path, "-c:v", "libx264", "-crf", "18",
+                 "-preset", "fast", concat_path],
+                capture_output=True, timeout=120,
+            )
+
+        # Cleanup temp list file
+        try:
+            os.remove(concat_list_path)
+        except Exception:
+            pass
+
+        total_dur = num_clips * dur
+        cost = FAL_VIDEO_MODELS.get(model_key, {}).get("cost", "?")
+        info = (
+            f"[Long Video] {num_clips}クリップ x {dur}秒 = 約{total_dur}秒\n"
+            f"Model: {model_key} | コスト: {cost} x {num_clips}\n"
+            f"結合動画: {concat_path}\n"
+            f"個別クリップ: {', '.join(os.path.basename(p) for p in clip_paths)}"
+        )
+        progress(1.0, desc="完了!")
+        return concat_path, info
+
+    except Exception as e:
+        logger.error(f"長尺動画生成エラー: {traceback.format_exc()}")
+        # Return partial results if any clips were generated
+        if clip_paths:
+            return clip_paths[-1], f"エラー: {e}\n\n生成済みクリップ ({len(clip_paths)}本): {', '.join(clip_paths)}"
+        raise gr.Error(f"長尺動画生成エラー: {e}")
+
+
+def generate_extend_video(video_file, prompt, model_key, num_extensions,
+                          duration_per_clip, negative_prompt="", mode="normal",
+                          progress=gr.Progress()):
+    """Extend an existing video by generating continuation clips from its last frame."""
+    if not fal.api_key:
+        raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
+    if video_file is None:
+        raise gr.Error("元動画をアップロードしてください。")
+
+    num_ext = int(num_extensions)
+    dur = int(duration_per_clip)
+    if num_ext < 1 or num_ext > 10:
+        raise gr.Error("延長クリップ数は1-10の範囲で指定してください。")
+
+    output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+    os.makedirs(output_dir, exist_ok=True)
+
+    video_path = video_file if isinstance(video_file, str) else video_file.name
+    clip_paths = [video_path]
+
+    try:
+        import fal_client as fc
+        os.environ["FAL_KEY"] = fal.api_key
+        import datetime as dt
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        img2vid_model = _find_matching_img2vid_model(model_key)
+
+        for i in range(1, num_ext + 1):
+            progress((i - 1) / num_ext, desc=f"延長クリップ {i}/{num_ext} を生成中...")
+
+            last_frame_img, _ = extract_last_frame(clip_paths[-1])
+            if last_frame_img is None:
+                raise RuntimeError(f"フレーム抽出失敗 (クリップ {len(clip_paths)})")
+
+            frame_path = os.path.join(output_dir, f"extend_frame{i:02d}_{ts}.png")
+            last_frame_img.save(frame_path)
+            frame_url = fc.upload_file(frame_path)
+
+            video_url = fal.img2vid(img2vid_model, frame_url,
+                                    prompt=prompt or "smooth continuation, consistent style",
+                                    duration=dur)
+            if not video_url:
+                raise RuntimeError(f"延長クリップ {i} の生成に失敗しました")
+
+            clip_path = os.path.join(output_dir, f"extend_clip{i:02d}_{ts}.mp4")
+            download_fal_video(video_url, clip_path)
+            clip_paths.append(clip_path)
+
+        # Concatenate
+        progress(0.95, desc="クリップを結合中...")
+        concat_path = os.path.join(output_dir, f"extended_final_{ts}.mp4")
+        concat_list_path = os.path.join(output_dir, f"extend_list_{ts}.txt")
+
+        with open(concat_list_path, "w") as f:
+            for cp in clip_paths:
+                f.write(f"file '{cp}'\n")
+
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+             "-i", concat_list_path, "-c", "copy", concat_path],
+            capture_output=True, timeout=60,
+        )
+        if result.returncode != 0:
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                 "-i", concat_list_path, "-c:v", "libx264", "-crf", "18",
+                 "-preset", "fast", concat_path],
+                capture_output=True, timeout=120,
+            )
+
+        try:
+            os.remove(concat_list_path)
+        except Exception:
+            pass
+
+        cost = FAL_IMG2VID_MODELS.get(img2vid_model, {}).get("cost", "?")
+        info = (
+            f"[Video Extend] {num_ext}クリップ追加 x {dur}秒\n"
+            f"Model: {img2vid_model} | コスト: {cost} x {num_ext}\n"
+            f"結合動画: {concat_path}"
+        )
+        progress(1.0, desc="完了!")
+        return concat_path, info
+
+    except Exception as e:
+        logger.error(f"動画延長エラー: {traceback.format_exc()}")
+        if len(clip_paths) > 1:
+            return clip_paths[-1], f"エラー: {e}\n\n生成済みクリップ ({len(clip_paths)-1}本追加)"
+        raise gr.Error(f"動画延長エラー: {e}")
+
+
+def _find_matching_img2vid_model(txt2vid_key):
+    """Find a matching img2vid model for a given txt2vid model."""
+    key_lower = txt2vid_key.lower()
+    if "wan 2.6" in key_lower:
+        return "Wan 2.6 img2vid (最新・NSFW OK)"
+    if "wan" in key_lower:
+        return "Wan 2.1 img2vid (高品質・NSFW OK)"
+    if "kling" in key_lower:
+        return "Kling 2.5 Turbo Pro img2vid (高品質・SFW)"
+    if "veo" in key_lower:
+        return "Veo 3 img2vid (Google最高品質・SFW)"
+    if "sora" in key_lower:
+        return "Sora 2 img2vid (OpenAI・SFW)"
+    if "ltx" in key_lower:
+        return "LTX 2.3 img2vid (高速・安い)"
+    # Default
+    return list(FAL_IMG2VID_MODELS.keys())[0]
+
+
+def generate_nsfw_with_fallback(prompt, preset_key, seed, auto_upscale=False):
+    """Generate NSFW image with automatic fallback chain: fal.ai → Dezgo → Novita."""
+    preset = NSFW_PRESETS.get(preset_key)
+    if not preset:
+        raise gr.Error(f"不明なプリセット: {preset_key}")
+
+    full_prompt = preset["prompt_base"]
+    if prompt.strip():
+        full_prompt = full_prompt + ", " + prompt.strip()
+
+    negative = preset["negative"]
+    settings = preset["settings"]
+    model_key = preset["recommended_models"][0]
+    s = int(seed)
+
+    # Try fal.ai first
+    if fal.api_key:
+        try:
+            urls = fal.generate_image(
+                model_key=model_key, prompt=full_prompt,
+                negative_prompt=negative,
+                width=settings["width"], height=settings["height"],
+                steps=settings["steps"], guidance=settings["cfg"],
+                seed=s, safety_checker=False,
+            )
+            images = []
+            saved = []
+            for url in urls:
+                img = download_fal_image(url)
+                images.append(img)
+                path = save_image_to_dir(img, config["output_dir_adult"], prefix="nsfw_fal")
+                saved.append(path)
+
+            # Auto upscale if requested
+            if auto_upscale and images:
+                try:
+                    upscaled_images = []
+                    for img in images:
+                        up_path = save_image_to_dir(img, config["output_dir_adult"], prefix="nsfw_pre_upscale")
+                        up_url = _upload_image_to_fal(up_path, config["output_dir_adult"], "nsfw_upscale")
+                        up_urls = fal.upscale(up_url, 2)
+                        if up_urls:
+                            up_img = download_fal_image(up_urls[0])
+                            upscaled_images.append(up_img)
+                            up_save = save_image_to_dir(up_img, config["output_dir_adult"], prefix="nsfw_hq")
+                            saved.append(up_save)
+                    if upscaled_images:
+                        images = upscaled_images
+                except Exception as ue:
+                    logger.error(f"Auto upscale failed: {ue}")
+
+            return images, f"[NSFW fal.ai: {preset_key}] Model: {model_key}\n保存先: {', '.join(saved)}"
+        except Exception as e:
+            if "content_policy_violation" not in str(e):
+                raise gr.Error(f"fal.ai NSFW生成エラー: {e}")
+            logger.info(f"fal.ai NSFWブロック → Dezgo/Novita にフォールバック")
+
+    # Fallback to Dezgo (completely uncensored)
+    if dezgo.api_key:
+        try:
+            png_bytes = dezgo.generate_image(
+                "Flux Dev (高品質)", full_prompt,
+                negative_prompt=negative,
+                width=settings["width"], height=settings["height"],
+                steps=settings.get("steps", 28), seed=s,
+            )
+            img = decode_dezgo_image(png_bytes)
+            path = save_image_to_dir(img, config["output_dir_adult"], prefix="nsfw_dezgo")
+            return [img], f"[NSFW Dezgo無検閲: {preset_key}]\n保存先: {path}"
+        except Exception as e:
+            logger.error(f"Dezgo NSFW fallback error: {e}")
+
+    # Fallback to Novita (uncensored models)
+    if novita.api_key:
+        try:
+            urls = novita.generate_image(
+                "Realistic Vision (フォトリアル)", full_prompt,
+                negative_prompt=negative,
+                width=settings["width"], height=settings["height"],
+                steps=settings.get("steps", 25), seed=s,
+            )
+            images = []
+            saved = []
+            for url in urls:
+                img = download_novita_image(url)
+                images.append(img)
+                path = save_image_to_dir(img, config["output_dir_adult"], prefix="nsfw_novita")
+                saved.append(path)
+            return images, f"[NSFW Novita無検閲: {preset_key}]\n保存先: {', '.join(saved)}"
+        except Exception as e:
+            logger.error(f"Novita NSFW fallback error: {e}")
+
+    raise gr.Error(
+        "NSFW生成に対応するAPIキーが設定されていません。\n\n"
+        "以下のいずれかを設定してください:\n"
+        "1. fal.ai (推奨・高品質)\n"
+        "2. Dezgo (完全無検閲)\n"
+        "3. Novita.ai (無検閲・安い)"
+    )
+
+
+def generate_nsfw_video_preset(prompt, preset_key, from_image=None):
+    """Generate NSFW video using preset with auto-fallback."""
+    preset = NSFW_VIDEO_PRESETS.get(preset_key)
+    if not preset:
+        raise gr.Error(f"不明な動画プリセット: {preset_key}")
+
+    full_prompt = preset["prompt_base"]
+    if prompt.strip():
+        full_prompt = full_prompt + ", " + prompt.strip()
+
+    neg = preset.get("negative", "")
+    dur = preset.get("duration", 5)
+
+    # img2vid if image provided
+    if from_image is not None:
+        model_key = preset.get("img2vid_model", "Wan 2.6 img2vid (最新・NSFW OK)")
+        return generate_fal_img2vid(from_image, full_prompt, model_key, "adult", dur)
+
+    # txt2vid
+    model_key = preset.get("model", "Wan 2.6 txt2vid (最新・NSFW OK)")
+    video_path, info = generate_fal_video(full_prompt, model_key, "adult",
+                                          duration=dur, negative_prompt=neg)
+    return _gradio_safe_video(video_path), info
+
+
+def generate_hq_image(prompt, negative_prompt, model_key, width, height,
+                      steps, guidance, seed, batch_size, auto_upscale, mode="normal"):
+    """Generate highest quality image with optional auto-upscale."""
+    if not fal.api_key:
+        raise gr.Error("fal.ai API Key が未設定です。")
+    if not prompt.strip():
+        raise gr.Error("プロンプトを入力してください。")
+
+    try:
+        w = max(256, (int(width) // 32) * 32)
+        h = max(256, (int(height) // 32) * 32)
+        urls = fal.generate_image(
+            model_key=model_key, prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=w, height=h,
+            steps=int(steps), guidance=float(guidance),
+            seed=int(seed), num_images=int(batch_size),
+            safety_checker=False,
+        )
+
+        images = []
+        saved = []
+        output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+        for url in urls:
+            img = download_fal_image(url)
+            images.append(img)
+            path = save_image_to_dir(img, output_dir, prefix=f"hq_{mode}")
+            saved.append(path)
+
+        # Auto upscale
+        if auto_upscale and images:
+            upscaled = []
+            for img in images:
+                try:
+                    tmp_path = save_image_to_dir(img, output_dir, prefix="hq_pre_up")
+                    up_url = _upload_image_to_fal(tmp_path, output_dir, "hq_upscale")
+                    up_urls = fal.upscale(up_url, 2)
+                    if up_urls:
+                        up_img = download_fal_image(up_urls[0])
+                        upscaled.append(up_img)
+                        up_save = save_image_to_dir(up_img, output_dir, prefix=f"hq_upscaled_{mode}")
+                        saved.append(up_save)
+                except Exception as ue:
+                    logger.error(f"HQ auto upscale failed: {ue}")
+                    upscaled.append(img)
+            if upscaled:
+                images = upscaled
+
+        cost = FAL_MODELS.get(model_key, {}).get("cost", "?")
+        up_info = " + 2x Upscale" if auto_upscale else ""
+        return images, f"[HQ {model_key}]{up_info}\n{w}x{h} → {'{}x{}'.format(w*2, h*2) if auto_upscale else f'{w}x{h}'}\nコスト: {cost}\n保存先: {', '.join(saved)}"
+    except Exception as e:
+        logger.error(f"HQ生成エラー: {traceback.format_exc()}")
+        raise gr.Error(f"HQ生成エラー: {e}")
+
+
+def generate_with_art_preset(prompt, preset_key, seed, mode="normal"):
+    """Generate image using artistic preset settings."""
+    if not fal.api_key:
+        raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
+    if not prompt.strip():
+        raise gr.Error("プロンプトを入力してください。")
+
+    preset = ART_PRESETS.get(preset_key)
+    if not preset:
+        raise gr.Error(f"不明なプリセット: {preset_key}")
+
+    full_prompt = prompt + preset["prompt_suffix"]
+    model_key = preset.get("model", "Flux Dev (高品質・NSFW OK)")
+
+    try:
+        urls = fal.generate_image(
+            model_key=model_key,
+            prompt=full_prompt,
+            negative_prompt=preset.get("negative", ""),
+            width=preset.get("width", 1024),
+            height=preset.get("height", 1024),
+            steps=preset.get("steps", 28),
+            guidance=preset.get("cfg", 3.5),
+            seed=int(seed),
+            safety_checker=False,
+        )
+        images = []
+        saved_paths = []
+        output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+        for url in urls:
+            img = download_fal_image(url)
+            images.append(img)
+            path = save_image_to_dir(img, output_dir, prefix=f"art_{mode}")
+            saved_paths.append(path)
+        return images, f"[Art Preset: {preset_key}]\nModel: {model_key}\n保存先: {', '.join(saved_paths)}"
+    except Exception as e:
+        logger.error(f"Art Preset生成エラー: {traceback.format_exc()}")
+        raise gr.Error(f"Art Preset生成エラー: {e}")
+
+
+def generate_face_swap(base_image, swap_image, mode="normal"):
+    """Face swap using fal.ai."""
+    if not fal.api_key:
+        raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
+    if base_image is None:
+        raise gr.Error("ベース画像（体・シーン）をアップロードしてください。")
+    if swap_image is None:
+        raise gr.Error("顔画像（入れ替える顔）をアップロードしてください。")
+
+    try:
+        from PIL import Image as PILImage
+        import base64
+        output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Upload images to fal storage
+        import fal_client as fc
+        os.environ["FAL_KEY"] = fal.api_key
+
+        # Save temp files and upload
+        ts = int(time.time())
+        base_path = os.path.join(output_dir, f"faceswap_base_{ts}.png")
+        swap_path = os.path.join(output_dir, f"faceswap_face_{ts}.png")
+
+        if isinstance(base_image, str):
+            base_path = base_image
+        else:
+            PILImage.fromarray(base_image).save(base_path)
+
+        if isinstance(swap_image, str):
+            swap_path = swap_image
+        else:
+            PILImage.fromarray(swap_image).save(swap_path)
+
+        base_url = fc.upload_file(base_path)
+        swap_url = fc.upload_file(swap_path)
+
+        result_url = fal.face_swap(base_url, swap_url)
+        if not result_url:
+            raise RuntimeError("Face Swap結果のURLが取得できませんでした")
+
+        result_img = download_fal_image(result_url)
+        save_path = save_image_to_dir(result_img, output_dir, prefix=f"faceswap_{mode}")
+        return result_img, f"[Face Swap] 完了!\n保存先: {save_path}"
+    except Exception as e:
+        logger.error(f"Face Swapエラー: {traceback.format_exc()}")
+        raise gr.Error(f"Face Swapエラー: {e}")
+
+
 def generate_fal_image_direct(prompt, model_key, width, height, seed, num_images, mode="normal"):
     """Generate image via fal.ai API with model selection."""
     if not fal.api_key:
@@ -643,7 +1845,967 @@ def generate_fal_image_direct(prompt, model_key, width, height, seed, num_images
         raise gr.Error(f"fal.ai生成エラー: {e}")
 
 
-def generate_fal_video(prompt, model_key, mode="normal"):
+def generate_fal_img2vid(image, prompt, model_key, mode="normal", duration=None):
+    """Generate video from image via fal.ai."""
+    if not fal.api_key:
+        raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
+    if image is None:
+        raise gr.Error("画像をアップロードしてください。")
+
+    try:
+        import fal_client as fc
+        os.environ["FAL_KEY"] = fal.api_key
+        from PIL import Image as PILImage
+
+        output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Save and upload image
+        ts = int(time.time())
+        if isinstance(image, str):
+            img_path = image
+        else:
+            img_path = os.path.join(output_dir, f"img2vid_input_{ts}.png")
+            PILImage.fromarray(image).save(img_path)
+
+        image_url = fc.upload_file(img_path)
+
+        dur = int(duration) if duration else None
+        video_url = fal.img2vid(model_key, image_url, prompt=prompt or "", duration=dur)
+        if not video_url:
+            raise RuntimeError("動画URLが取得できませんでした")
+
+        video_path = os.path.join(output_dir, f"fal_img2vid_{ts}.mp4")
+        download_fal_video(video_url, video_path)
+
+        model_info = FAL_IMG2VID_MODELS.get(model_key, {})
+        cost = model_info.get("cost", "?")
+        dur_info = f" | {dur}秒" if dur else ""
+        return _gradio_safe_video(video_path), f"[fal.ai img2vid {model_key}] コスト: {cost}{dur_info}\n保存先: {video_path}"
+    except Exception as e:
+        error_str = str(e)
+        logger.error(f"fal.ai img2vidエラー: {traceback.format_exc()}")
+        if "content_policy_violation" in error_str:
+            raise gr.Error(
+                "fal.aiがNSFWコンテンツをブロックしました。\n\n"
+                "img2vidのNSFW → ローカル AnimateDiff (img2vidタブ) を使ってください。"
+            )
+        raise gr.Error(f"fal.ai img2vidエラー: {e}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Image to Video Pro — VLM-assisted (Preserve & Inspired modes)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+from vision_analyzer import (
+    analyze_for_motion,
+    describe_for_inspiration,
+    MOTION_PRESETS,
+)
+
+
+def _get_vision_keys():
+    """Return (openai_key, anthropic_key) tuple from config."""
+    return (
+        config.get("openai_api_key", ""),
+        config.get("anthropic_api_key", ""),
+    )
+
+
+def img2vid_analyze_motion(image):
+    """Auto-analyze image for natural motion prompt (Preserve mode helper).
+
+    Called by the 'Auto-analyze' button. Returns analyzed motion prompt.
+    """
+    if image is None:
+        raise gr.Error("画像をアップロードしてください。")
+    openai_key, anthropic_key = _get_vision_keys()
+    if not openai_key and not anthropic_key:
+        raise gr.Error(
+            "OpenAI または Anthropic API Key が必要です。\n"
+            "Settings → OpenAI API Key または Anthropic API Key を設定してください。"
+        )
+    try:
+        motion_prompt = analyze_for_motion(image, openai_key, anthropic_key)
+        return motion_prompt
+    except Exception as e:
+        logger.error(f"Image analysis (motion) failed: {traceback.format_exc()}")
+        raise gr.Error(f"画像分析エラー: {e}")
+
+
+def img2vid_analyze_inspiration(image):
+    """Auto-analyze image for full scene description (Inspired mode helper).
+
+    Called by the 'Auto-analyze' button. Returns scene description.
+    """
+    if image is None:
+        raise gr.Error("画像をアップロードしてください。")
+    openai_key, anthropic_key = _get_vision_keys()
+    if not openai_key and not anthropic_key:
+        raise gr.Error(
+            "OpenAI または Anthropic API Key が必要です。\n"
+            "Settings → OpenAI API Key または Anthropic API Key を設定してください。"
+        )
+    try:
+        description = describe_for_inspiration(image, openai_key, anthropic_key)
+        return description
+    except Exception as e:
+        logger.error(f"Image analysis (inspiration) failed: {traceback.format_exc()}")
+        raise gr.Error(f"画像分析エラー: {e}")
+
+
+def generate_img2vid_preserve(image, motion_prompt, motion_preset, fal_model_key,
+                              auto_analyze, duration, mode="normal"):
+    """Preserve mode: animate the image while keeping content exact.
+
+    Workflow:
+    1. If auto_analyze=True and motion_prompt is empty → run VLM analysis
+    2. Append motion preset suffix
+    3. Send to fal.ai img2vid model (Kling / Wan / Veo preserve the image)
+
+    Args:
+        image: numpy array or PIL image from Gradio
+        motion_prompt: User-provided or auto-analyzed motion description
+        motion_preset: Key from MOTION_PRESETS (appended to prompt)
+        fal_model_key: Key into FAL_IMG2VID_MODELS
+        auto_analyze: If True and prompt empty, run VLM
+        duration: seconds
+        mode: "normal" or "adult" (output folder)
+    """
+    if image is None:
+        raise gr.Error("画像をアップロードしてください。")
+
+    final_prompt = (motion_prompt or "").strip()
+
+    # Auto-analyze if requested and prompt empty
+    if auto_analyze and not final_prompt:
+        try:
+            openai_key, anthropic_key = _get_vision_keys()
+            if openai_key or anthropic_key:
+                final_prompt = analyze_for_motion(image, openai_key, anthropic_key)
+                logger.info(f"[Preserve] auto motion: {final_prompt[:100]}")
+        except Exception as e:
+            logger.error(f"Auto-analyze failed, using empty prompt: {e}")
+
+    # Append motion preset
+    if motion_preset and motion_preset in MOTION_PRESETS and MOTION_PRESETS[motion_preset]:
+        final_prompt = (final_prompt + MOTION_PRESETS[motion_preset]).strip(", ")
+
+    if not final_prompt:
+        final_prompt = "subtle natural motion, gentle breeze, cinematic"
+
+    # Delegate to existing fal.ai img2vid pipeline
+    video_out, info = generate_fal_img2vid(image, final_prompt, fal_model_key, mode, duration)
+    full_info = (
+        f"[Preserve Mode / {fal_model_key}]\n"
+        f"Prompt: {final_prompt[:200]}\n"
+        f"{info}"
+    )
+    return video_out, full_info
+
+
+def generate_img2vid_inspired(image, description, style_hint, fal_t2v_model, duration, mode="normal"):
+    """Inspired mode: analyze image, then generate a NEW video from the description.
+
+    Workflow:
+    1. If description is empty → analyze image with VLM
+    2. Append style hint (e.g., "anime style", "cinematic", "dreamy")
+    3. Send description to fal.ai txt2vid (no image conditioning)
+
+    Args:
+        image: numpy array or PIL (only for analysis, not sent to txt2vid)
+        description: User-provided or auto-analyzed scene description
+        style_hint: Optional style modifier
+        fal_t2v_model: Key into FAL_VIDEO_MODELS (txt2vid)
+        duration: seconds
+        mode: "normal" or "adult"
+    """
+    if image is None and not description:
+        raise gr.Error("画像または説明文のいずれかが必要です。")
+
+    final_desc = (description or "").strip()
+
+    # Auto-analyze if no description provided
+    if not final_desc:
+        try:
+            openai_key, anthropic_key = _get_vision_keys()
+            if not openai_key and not anthropic_key:
+                raise gr.Error(
+                    "OpenAI または Anthropic API Key が必要です (画像分析のため)。\n"
+                    "Settingsタブで設定するか、説明文を手動入力してください。"
+                )
+            final_desc = describe_for_inspiration(image, openai_key, anthropic_key)
+            logger.info(f"[Inspired] auto description: {final_desc[:100]}")
+        except gr.Error:
+            raise
+        except Exception as e:
+            logger.error(f"Inspired analyze failed: {traceback.format_exc()}")
+            raise gr.Error(f"画像分析エラー: {e}")
+
+    # Apply style hint
+    if style_hint and style_hint.strip():
+        final_desc = f"{final_desc}, {style_hint.strip()}"
+
+    # Delegate to existing fal.ai txt2vid pipeline
+    video_out, info = generate_fal_video(
+        prompt=final_desc,
+        model_key=fal_t2v_model,
+        mode=mode,
+        duration=int(duration) if duration else None,
+    )
+    full_info = (
+        f"[Inspired Mode / {fal_t2v_model}]\n"
+        f"Description: {final_desc[:300]}\n"
+        f"{info}"
+    )
+    return video_out, full_info
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Wan 2.2 NSFW Lightning (dedicated high-VRAM backend)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _get_wan22_client():
+    """Get ComfyUI client for Wan 2.2 dedicated backend.
+
+    Priority: wan22_comfyui_url → vast_comfyui_url → main comfyui_url.
+    This allows routing Wan 2.2 to a dedicated high-VRAM instance while
+    keeping the regular image generation on a smaller backend.
+    """
+    url = (
+        config.get("wan22_comfyui_url")
+        or config.get("vast_comfyui_url")
+        or config.get("comfyui_url")
+    )
+    return ComfyUIClient(url)
+
+
+def generate_wan22_t2v(prompt, negative_prompt, width, height, duration,
+                      steps, cfg, seed, mode="normal"):
+    """Generate text-to-video using Wan 2.2 NSFW Lightning on dedicated backend.
+
+    Requires:
+    - ComfyUI-GGUF custom node installed
+    - wan22_nsfw_fm_v2_{high,low}_Q4_K_M.gguf in models/unet/ (or wherever GGUF looks)
+    - umt5_xxl_fp8_e4m3fn_scaled.safetensors in models/text_encoders/
+    - wan_2.1_vae.safetensors in models/vae/
+    """
+    if not prompt or not prompt.strip():
+        raise gr.Error("プロンプトを入力してください。")
+
+    wan_client = _get_wan22_client()
+    if not wan_client.is_server_running():
+        raise gr.Error(
+            f"Wan 2.2 ComfyUI に接続できません ({wan_client.server_url})\n"
+            "Settingsタブで wan22_comfyui_url を設定してください。"
+        )
+
+    # 81 frames @ 16fps = 5 sec default. Compute from duration.
+    fps = WAN22_DEFAULTS["fps"]
+    frame_count = int(float(duration) * fps) if duration else WAN22_DEFAULTS["frame_count"]
+    # Wan requires frame_count = 4N+1 (81, 65, 49, 33, ...)
+    frame_count = ((frame_count - 1) // 4) * 4 + 1
+    frame_count = max(17, min(frame_count, 241))  # 1-15 sec clamp (@16fps)
+
+    workflow = build_wan22_t2v_workflow(
+        prompt=prompt,
+        negative_prompt=negative_prompt or "worst quality, blurry, static",
+        width=int(width) if width else WAN22_DEFAULTS["width"],
+        height=int(height) if height else WAN22_DEFAULTS["height"],
+        frame_count=frame_count,
+        fps=fps,
+        steps=int(steps) if steps else WAN22_DEFAULTS["steps"],
+        cfg=float(cfg) if cfg else WAN22_DEFAULTS["cfg"],
+        seed=int(seed) if seed is not None else -1,
+    )
+
+    output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        frames, video_path = wan_client.generate_video(workflow, output_dir, timeout=1800)
+        if not video_path:
+            raise RuntimeError("動画ファイルが生成されませんでした")
+        info = (
+            f"[Wan 2.2 NSFW Lightning T2V]\n"
+            f"Prompt: {prompt[:150]}\n"
+            f"Frames: {frame_count} @ {fps}fps = {frame_count/fps:.1f}秒\n"
+            f"保存先: {video_path}"
+        )
+        return _gradio_safe_video(video_path), info
+    except Exception as e:
+        logger.error(f"Wan 2.2 T2V error: {traceback.format_exc()}")
+        raise gr.Error(f"Wan 2.2 T2V エラー: {e}")
+
+
+def generate_wan22_i2v(image, prompt, negative_prompt, width, height, duration,
+                      steps, cfg, seed, mode="normal"):
+    """Generate image-to-video using Wan 2.2 NSFW Lightning I2V on dedicated backend."""
+    if image is None:
+        raise gr.Error("画像をアップロードしてください。")
+
+    wan_client = _get_wan22_client()
+    if not wan_client.is_server_running():
+        raise gr.Error(
+            f"Wan 2.2 ComfyUI に接続できません ({wan_client.server_url})\n"
+            "Settingsタブで wan22_comfyui_url を設定してください。"
+        )
+
+    # Save image and upload to ComfyUI
+    from PIL import Image as PILImage
+    ts = int(time.time())
+    tmp_path = os.path.join("/tmp", f"wan22_i2v_input_{ts}.png")
+    if isinstance(image, str):
+        PILImage.open(image).save(tmp_path)
+    else:
+        PILImage.fromarray(image).save(tmp_path)
+
+    upload_result = wan_client.upload_image(tmp_path)
+    image_name = upload_result.get("name") if isinstance(upload_result, dict) else os.path.basename(tmp_path)
+
+    fps = WAN22_DEFAULTS["fps"]
+    frame_count = int(float(duration) * fps) if duration else WAN22_DEFAULTS["frame_count"]
+    frame_count = ((frame_count - 1) // 4) * 4 + 1
+    frame_count = max(17, min(frame_count, 241))
+
+    workflow = build_wan22_i2v_workflow(
+        prompt=prompt or "",
+        image_name=image_name,
+        negative_prompt=negative_prompt or "worst quality, blurry, static, distorted",
+        width=int(width) if width else WAN22_DEFAULTS["width"],
+        height=int(height) if height else WAN22_DEFAULTS["height"],
+        frame_count=frame_count,
+        fps=fps,
+        steps=int(steps) if steps else WAN22_DEFAULTS["steps"],
+        cfg=float(cfg) if cfg else WAN22_DEFAULTS["cfg"],
+        seed=int(seed) if seed is not None else -1,
+    )
+
+    output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        frames, video_path = wan_client.generate_video(workflow, output_dir, timeout=1800)
+        if not video_path:
+            raise RuntimeError("動画ファイルが生成されませんでした")
+        info = (
+            f"[Wan 2.2 NSFW Lightning I2V]\n"
+            f"Motion Prompt: {prompt[:150] if prompt else '(なし)'}\n"
+            f"Frames: {frame_count} @ {fps}fps = {frame_count/fps:.1f}秒\n"
+            f"保存先: {video_path}"
+        )
+        return _gradio_safe_video(video_path), info
+    except Exception as e:
+        logger.error(f"Wan 2.2 I2V error: {traceback.format_exc()}")
+        raise gr.Error(f"Wan 2.2 I2V エラー: {e}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Adult Studio Functions
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _adult_generate_image(prompt, negative, w=832, h=1216, seed=-1, prefix="adult", civitai_model=None,
+                          model_override=None, lora_override=None, lora_str=0.8, vae_override=None,
+                          steps_override=None, cfg_override=None, sampler_override=None, scheduler_override=None,
+                          hires_fix=False, hires_scale=1.5, hires_denoise=0.5, hires_steps=15, upscale_model="",
+                          face_detailer=False, face_denoise=0.4, face_guide_size=512,
+                          lora2_name=None, lora2_str=0.8, lora3_name=None, lora3_str=0.8):
+    """Generate NSFW image using the best available uncensored backend.
+
+    Priority: ComfyUI → Novita → Dezgo → CivitAI → fal.ai (last resort).
+    If model_override is specified, ComfyUI uses that model directly.
+    If civitai_model is specified, CivitAI is tried first.
+    """
+    output_dir = config["output_dir_adult"]
+    os.makedirs(output_dir, exist_ok=True)
+    backend = config.get("backend", "local")
+    s = int(seed) if seed is not None else -1
+    errors = []
+
+    # Build LoRA list for multi-LoRA support
+    loras_list = []
+    if lora_override and lora_override not in ("None", "なし", ""):
+        loras_list.append((lora_override, float(lora_str)))
+    if lora2_name and lora2_name not in ("None", "なし", ""):
+        loras_list.append((lora2_name, float(lora2_str)))
+    if lora3_name and lora3_name not in ("None", "なし", ""):
+        loras_list.append((lora3_name, float(lora3_str)))
+
+    # Resolve VAE
+    vae_name = vae_override if vae_override and vae_override not in ("None", "Auto", "") else ""
+
+    # ── 0. CivitAI — 指定モデルがあれば最優先 ──
+    if civitai_model and civitai.api_key:
+        try:
+            # iCloudモデルの場合はURN解決してクラウド生成
+            if civitai_model.startswith("[iCloud] "):
+                icloud_filename = civitai_model[len("[iCloud] "):]
+                urn_info = civitai.resolve_icloud_model_urn(icloud_filename)
+                if urn_info and urn_info.get("type", "").lower() != "lora":
+                    urls = civitai.generate_image_by_urn(
+                        model_urn=urn_info["urn"], base_model=urn_info["base"],
+                        prompt=prompt, negative_prompt=negative, width=w, height=h)
+                    if urls:
+                        images = []
+                        saved = []
+                        for url in (urls if isinstance(urls, list) else [urls]):
+                            img = download_fal_image(url) if isinstance(url, str) and url.startswith("http") else url
+                            if img:
+                                images.append(img)
+                                saved.append(save_image_to_dir(img, output_dir, prefix=f"{prefix}_civitai_icloud"))
+                        if images:
+                            model_label = f"{urn_info['name']} ({urn_info.get('version', '')})"
+                            return images, f"[CivitAI iCloud] {model_label}\nPrompt: {prompt[:150]}...\n保存先: {', '.join(saved)}"
+            else:
+                model_info = CIVITAI_GENERATION_MODELS.get(civitai_model)
+                if model_info:
+                    urls = civitai.generate_image(civitai_model, prompt, negative_prompt=negative,
+                                                  width=w, height=h)
+                    if urls:
+                        images = []
+                        saved = []
+                        for url in (urls if isinstance(urls, list) else [urls]):
+                            img = download_fal_image(url) if isinstance(url, str) and url.startswith("http") else url
+                            if img:
+                                images.append(img)
+                                saved.append(save_image_to_dir(img, output_dir, prefix=f"{prefix}_civitai"))
+                        if images:
+                            return images, f"[CivitAI 指定モデル] {civitai_model}\nPrompt: {prompt[:150]}...\n保存先: {', '.join(saved)}"
+        except Exception as e:
+            errors.append(f"CivitAI ({civitai_model}): {e}")
+
+    # ── 1. ComfyUI (Vast.ai / RunPod / Local) — 完全無検閲 ──
+    if client.is_server_running():
+        try:
+            models = client.get_models()
+            if not models:
+                models = _get_models_for_backend()
+
+            # Use model_override if specified, otherwise auto-select
+            if model_override and model_override not in ("(自動)", ""):
+                chosen = model_override
+            else:
+                chosen = _select_nsfw_model(models, prompt)
+
+            # Determine generation parameters (override > default)
+            gen_steps = int(steps_override) if steps_override else 28
+            gen_cfg = float(cfg_override) if cfg_override else 7.5
+            gen_sampler = sampler_override if sampler_override else "euler_ancestral"
+            gen_scheduler = scheduler_override if scheduler_override else "normal"
+
+            if models or model_override:
+                workflow = build_txt2img_workflow(
+                    prompt, negative, chosen, w, h, gen_steps, gen_cfg,
+                    gen_sampler, gen_scheduler, s, 1,
+                    loras=loras_list,
+                    vae_name=vae_name,
+                    hires_fix=hires_fix, hires_scale=hires_scale,
+                    hires_denoise=hires_denoise, hires_steps=hires_steps,
+                    upscale_model=upscale_model,
+                    face_detailer=face_detailer, face_denoise=face_denoise,
+                    face_guide_size=face_guide_size,
+                )
+                result = client.generate(workflow)
+                if result:
+                    saved = []
+                    for img in result:
+                        saved.append(save_image_to_dir(img, output_dir, prefix=prefix))
+                    lora_info = f"\nLoRA: {', '.join(f'{n} ({s})' for n, s in loras_list)}" if loras_list else ""
+                    return result, f"[ComfyUI 無検閲] Model: {chosen}{lora_info}\nPrompt: {prompt[:150]}...\n保存先: {', '.join(saved)}"
+        except Exception as e:
+            errors.append(f"ComfyUI: {e}")
+
+    # ── 2. Novita.ai — 無検閲モデル ──
+    if novita.api_key:
+        try:
+            model_key = "Realistic Vision (フォトリアル)" if "anime" not in prompt.lower() else "MeinaMix (アニメ)"
+            results = novita.generate_image(model_key, prompt, negative_prompt=negative,
+                                            width=min(w, 1024), height=min(h, 1024), seed=s)
+            if results:
+                images = []
+                saved = []
+                for img_b64 in results:
+                    img = download_novita_image(img_b64) if isinstance(img_b64, str) and img_b64.startswith("http") else None
+                    if img is None and isinstance(img_b64, str):
+                        import base64
+                        img = Image.open(io.BytesIO(base64.b64decode(img_b64)))
+                    if img:
+                        images.append(img)
+                        saved.append(save_image_to_dir(img, output_dir, prefix=f"{prefix}_novita"))
+                if images:
+                    return images, f"[Novita 無検閲] Prompt: {prompt[:150]}...\n保存先: {', '.join(saved)}"
+        except Exception as e:
+            errors.append(f"Novita: {e}")
+
+    # ── 3. Dezgo — 完全無検閲 ──
+    if dezgo.api_key:
+        try:
+            img_bytes = dezgo.generate_image("Flux Dev (高品質)", prompt, negative_prompt=negative,
+                                             width=w, height=h, seed=s)
+            if img_bytes:
+                img = decode_dezgo_image(img_bytes)
+                if img:
+                    path = save_image_to_dir(img, output_dir, prefix=f"{prefix}_dezgo")
+                    return [img], f"[Dezgo 無検閲] Prompt: {prompt[:150]}...\n保存先: {path}"
+        except Exception as e:
+            errors.append(f"Dezgo: {e}")
+
+    # ── 4. CivitAI Generation API ──
+    if civitai.api_key:
+        try:
+            civitai_models = list(CIVITAI_GENERATION_MODELS.keys())
+            if civitai_models:
+                result = civitai.generate_image(civitai_models[0], prompt, negative_prompt=negative,
+                                                width=w, height=h)
+                if result:
+                    images = []
+                    saved = []
+                    for img in (result if isinstance(result, list) else [result]):
+                        if img:
+                            images.append(img)
+                            saved.append(save_image_to_dir(img, output_dir, prefix=f"{prefix}_civitai"))
+                    if images:
+                        return images, f"[CivitAI] Prompt: {prompt[:150]}...\n保存先: {', '.join(saved)}"
+        except Exception as e:
+            errors.append(f"CivitAI: {e}")
+
+    # ── 5. fal.ai — 最終手段 (NSFWブロックの可能性あり) ──
+    if fal.api_key:
+        try:
+            model_key = "Flux Dev (高品質・NSFW OK)"
+            urls = fal.generate_image(model_key, prompt, negative_prompt=negative,
+                                      width=w, height=h, seed=s)
+            if urls:
+                images = []
+                saved = []
+                for url in urls:
+                    img = download_fal_image(url)
+                    if img:
+                        images.append(img)
+                        saved.append(save_image_to_dir(img, output_dir, prefix=f"{prefix}_fal"))
+                if images:
+                    return images, f"[fal.ai] ⚠黒画像ならNovita/Dezgo/Vast.aiを使ってください\nPrompt: {prompt[:150]}...\n保存先: {', '.join(saved)}"
+        except Exception as e:
+            errors.append(f"fal.ai: {e}")
+
+    error_detail = "\n".join(errors) if errors else "APIキーが未設定です"
+    raise gr.Error(
+        f"全バックエンドで生成失敗:\n{error_detail}\n\n"
+        f"推奨: Novita.ai / Dezgo / Vast.ai ComfyUI のAPIキーを設定してください。"
+    )
+
+
+def generate_character_image(style_key, ethnicity, age, body_type, breast, butt,
+                             hair_color, hair_style, skin, expression, clothing,
+                             pose, position, camera, setting, people_count,
+                             custom_prompt, seed, civitai_model="(自動)",
+                             model_sel="(自動)", lora1="None", lora1_str=0.8,
+                             lora2="None", lora2_str=0.8, lora3="None", lora3_str=0.8,
+                             vae_sel="None",
+                             steps=None, cfg=None, sampler=None, scheduler=None,
+                             width=832, height=1216,
+                             hires_fix=False, hires_scale=1.5, hires_denoise=0.5, hires_steps=15, upscale_model="None",
+                             face_detailer=False, face_denoise=0.4, face_guide_size=512):
+    """Generate image from character builder selections."""
+    prompt, negative = compose_character_prompt(
+        style_key, ethnicity, age, body_type, breast, butt, hair_color,
+        hair_style, skin, expression, clothing, pose, position, camera,
+        setting, people_count, custom_prompt
+    )
+    if not prompt.strip():
+        raise gr.Error("少なくとも1つの項目を選択してください。")
+    model = civitai_model if civitai_model and civitai_model != "(自動)" else None
+    model_ov = model_sel if model_sel and model_sel != "(自動)" else None
+    return _adult_generate_image(
+        prompt, negative, w=int(width), h=int(height), seed=seed, prefix="char_builder",
+        civitai_model=model, model_override=model_ov,
+        lora_override=lora1, lora_str=lora1_str,
+        lora2_name=lora2, lora2_str=lora2_str,
+        lora3_name=lora3, lora3_str=lora3_str,
+        vae_override=vae_sel,
+        steps_override=steps, cfg_override=cfg, sampler_override=sampler, scheduler_override=scheduler,
+        hires_fix=hires_fix, hires_scale=hires_scale, hires_denoise=hires_denoise,
+        hires_steps=hires_steps, upscale_model=upscale_model if upscale_model != "None" else "",
+        face_detailer=face_detailer, face_denoise=face_denoise, face_guide_size=face_guide_size,
+    )
+
+
+def generate_scene_category(category_key, custom_addition, seed, civitai_model="(自動)",
+                            model_sel="(自動)", lora1="None", lora1_str=0.8,
+                            lora2="None", lora2_str=0.8, lora3="None", lora3_str=0.8,
+                            vae_sel="None",
+                            steps=None, cfg=None, sampler=None, scheduler=None,
+                            width=832, height=1216,
+                            hires_fix=False, hires_scale=1.5, hires_denoise=0.5, hires_steps=15, upscale_model="None",
+                            face_detailer=False, face_denoise=0.4, face_guide_size=512):
+    """Generate image from a scene category preset."""
+    prompt, negative = compose_scene_prompt(category_key, custom_addition)
+    if not prompt.strip():
+        raise gr.Error("カテゴリを選択してください。")
+    model = civitai_model if civitai_model and civitai_model != "(自動)" else None
+    model_ov = model_sel if model_sel and model_sel != "(自動)" else None
+    return _adult_generate_image(
+        prompt, negative, w=int(width), h=int(height), seed=seed, prefix="scene",
+        civitai_model=model, model_override=model_ov,
+        lora_override=lora1, lora_str=lora1_str,
+        lora2_name=lora2, lora2_str=lora2_str,
+        lora3_name=lora3, lora3_str=lora3_str,
+        vae_override=vae_sel,
+        steps_override=steps, cfg_override=cfg, sampler_override=sampler, scheduler_override=scheduler,
+        hires_fix=hires_fix, hires_scale=hires_scale, hires_denoise=hires_denoise,
+        hires_steps=hires_steps, upscale_model=upscale_model if upscale_model != "None" else "",
+        face_detailer=face_detailer, face_denoise=face_denoise, face_guide_size=face_guide_size,
+    )
+
+
+def _select_nsfw_model(models, prompt_hint=""):
+    """Select best NSFW-capable model from available models.
+
+    Preference order (by actual model strength for NSFW):
+    - Anime/hentai hint → cyberrealisticPony (Pony NSFW)
+    - Asian/photo hint → chilloutmix (Asian NSFW SD1.5)
+    - SDXL / high-res → realvisxlV50
+    - Default photo NSFW → epicphotogasm (uncensored photo SD1.5)
+    """
+    if not models:
+        return "realvisxlV50.safetensors"
+
+    hint = (prompt_hint or "").lower()
+    is_anime = any(k in hint for k in ["anime", "hentai", "manga", "アニメ", "pony"])
+    is_asian = any(k in hint for k in ["asian", "japanese", "korean", "chinese", "日本人", "アジア"])
+
+    if is_anime:
+        priority = ["cyberrealisticpony", "pony", "epicphotogasm", "chilloutmix", "realvisxl"]
+    elif is_asian:
+        priority = ["chilloutmix", "epicphotogasm", "realvisxl", "cyberrealistic"]
+    else:
+        priority = ["epicphotogasm", "realvisxl", "chilloutmix", "cyberrealistic", "juggernaut", "epicrealism"]
+
+    for pref in priority:
+        for m in models:
+            if pref.lower() in m.lower():
+                return m
+    # Skip base SD1.5 / SDXL models (not NSFW-tuned)
+    for m in models:
+        name = m.lower()
+        if "v1-5-pruned" not in name and "sd_xl_base" not in name and "flux" not in name:
+            return m
+    return models[0]
+
+
+def generate_undress_edit(editor_data, undress_mode, custom_prompt, seed, denoise_strength,
+                          model_sel="(自動)", lora1="None", lora1_str=0.8):
+    """Edit clothing using inpainting (mask) or img2img fallback."""
+    if editor_data is None:
+        raise gr.Error("画像をアップロードしてください。")
+
+    from PIL import Image as PILImage
+    import numpy as np
+
+    edit_prompt, edit_negative, default_strength = get_undress_params(undress_mode)
+    if custom_prompt and custom_prompt.strip():
+        edit_prompt += ", " + custom_prompt.strip()
+
+    # Use user-specified denoise or default from mode
+    strength = denoise_strength if denoise_strength is not None else default_strength
+
+    output_dir = config["output_dir_adult"]
+    os.makedirs(output_dir, exist_ok=True)
+    ts = int(time.time())
+    s = int(seed) if seed is not None and seed >= 0 else -1
+
+    # Extract image and mask from editor
+    # Gradio ImageEditor returns dict: {"background": ndarray, "layers": [ndarray...], "composite": ndarray}
+    if isinstance(editor_data, dict):
+        bg = editor_data.get("background")
+        layers = editor_data.get("layers", [])
+        composite = editor_data.get("composite")
+
+        # Save background image
+        if bg is not None:
+            img_pil = PILImage.fromarray(bg) if isinstance(bg, np.ndarray) else PILImage.open(bg)
+        elif composite is not None:
+            img_pil = PILImage.fromarray(composite) if isinstance(composite, np.ndarray) else PILImage.open(composite)
+        else:
+            raise gr.Error("画像が読み取れません。")
+
+        # Extract mask from layers (white = edit area)
+        mask_pil = None
+        for layer in layers:
+            if layer is not None:
+                layer_arr = np.array(layer) if not isinstance(layer, np.ndarray) else layer
+                # Check if layer has any non-transparent pixels (mask drawn)
+                if layer_arr.ndim == 3 and layer_arr.shape[2] == 4:
+                    alpha = layer_arr[:, :, 3]
+                    if alpha.max() > 0:
+                        mask_pil = PILImage.fromarray((alpha > 128).astype(np.uint8) * 255, mode="L")
+                        break
+                elif layer_arr.ndim == 3 and layer_arr.shape[2] == 3:
+                    gray = np.mean(layer_arr, axis=2)
+                    if gray.max() > 10:
+                        mask_pil = PILImage.fromarray((gray > 10).astype(np.uint8) * 255, mode="L")
+                        break
+                elif layer_arr.ndim == 2:
+                    if layer_arr.max() > 0:
+                        mask_pil = PILImage.fromarray((layer_arr > 128).astype(np.uint8) * 255, mode="L")
+                        break
+    elif isinstance(editor_data, np.ndarray):
+        img_pil = PILImage.fromarray(editor_data)
+        mask_pil = None
+    else:
+        img_pil = PILImage.open(editor_data) if isinstance(editor_data, str) else PILImage.fromarray(editor_data)
+        mask_pil = None
+
+    img_path = os.path.join(output_dir, f"undress_input_{ts}.png")
+    img_pil.save(img_path)
+
+    has_mask = mask_pil is not None
+    if has_mask:
+        # Embed mask as alpha channel into the image for ComfyUI LoadImage
+        # ComfyUI: alpha=0 → inpaint (regenerate), alpha=255 → keep
+        # User paints white (255) on clothing = area to change → invert for alpha
+        inverted_mask = PILImage.fromarray(255 - np.array(mask_pil), mode="L")
+        img_rgba = img_pil.convert("RGBA")
+        img_rgba.putalpha(inverted_mask)
+        img_path_inpaint = os.path.join(output_dir, f"undress_inpaint_{ts}.png")
+        img_rgba.save(img_path_inpaint)
+        # Also save mask separately for debugging
+        mask_path = os.path.join(output_dir, f"undress_mask_{ts}.png")
+        mask_pil.save(mask_path)
+        logger.info(f"[Undress] Mask detected, using inpainting mode")
+    else:
+        img_path_inpaint = img_path
+        logger.info(f"[Undress] No mask, using img2img mode (denoise={strength})")
+
+    errors = []
+
+    # ── 1. ComfyUI Inpainting/img2img — 完全無検閲 ──
+    if client.is_server_running():
+        try:
+            img_filename = f"undress_{ts}.png"
+            client.upload_image(img_path, img_filename)
+
+            remote_models = client.get_models()
+            if not remote_models:
+                remote_models = _get_models_for_backend()
+            if model_sel and model_sel not in ("(自動)", ""):
+                model_name = model_sel
+            else:
+                model_name = _select_nsfw_model(remote_models)
+            # Build LoRA list for undress
+            ud_loras = []
+            if lora1 and lora1 not in ("None", "なし", ""):
+                ud_loras.append((lora1, float(lora1_str)))
+            logger.info(f"[Undress] ComfyUI model: {model_name}")
+
+            if has_mask:
+                # Inpainting: upload image with alpha mask embedded
+                inpaint_filename = f"undress_inpaint_{ts}.png"
+                client.upload_image(img_path_inpaint, inpaint_filename)
+                workflow = build_inpaint_workflow(
+                    edit_prompt, edit_negative, model_name,
+                    image_path=inpaint_filename,
+                    width=img_pil.width, height=img_pil.height,
+                    steps=35, cfg=5.0,
+                    sampler="euler_ancestral", scheduler="normal",
+                    seed=s, denoise=strength,
+                )
+            else:
+                # img2img: lower denoise to preserve more of original
+                workflow = build_img2img_workflow(
+                    edit_prompt, edit_negative, model_name,
+                    image_path=img_filename,
+                    width=img_pil.width, height=img_pil.height,
+                    steps=30, cfg=7.0,
+                    sampler="euler_ancestral", scheduler="normal",
+                    seed=s, denoise=strength,
+                )
+
+            result = client.generate(workflow)
+            logger.info(f"[Undress] ComfyUI result: {len(result) if result else 0} images")
+            if result:
+                saved = []
+                for img in result:
+                    saved.append(save_image_to_dir(img, output_dir, prefix="undress"))
+                mode_str = "Inpaint (マスク)" if has_mask else "img2img"
+                return result, f"[ComfyUI {mode_str} 無検閲] {undress_mode} | Model: {model_name} | denoise={strength}\n保存先: {', '.join(saved)}"
+        except Exception as e:
+            logger.error(f"[Undress] ComfyUI failed: {e}")
+            errors.append(f"ComfyUI: {e}")
+
+    # ── 2. Novita.ai img2img — 無検閲 ──
+    if novita.api_key:
+        try:
+            model_key = "Realistic Vision (フォトリアル)" if "anime" not in edit_prompt.lower() else "MeinaMix (アニメ)"
+            logger.info(f"[Undress] Trying Novita img2img with {model_key}")
+            urls = novita.img2img(model_key, edit_prompt, img_path,
+                                  negative_prompt=edit_negative, strength=strength, seed=s)
+            if urls:
+                images = []
+                saved = []
+                for url in urls:
+                    img = download_novita_image(url)
+                    if img:
+                        images.append(img)
+                        saved.append(save_image_to_dir(img, output_dir, prefix="undress_novita"))
+                if images:
+                    return images, f"[Novita 無検閲 img2img] {undress_mode}\n保存先: {', '.join(saved)}"
+        except Exception as e:
+            logger.error(f"[Undress] Novita failed: {e}")
+            errors.append(f"Novita img2img: {e}")
+
+    # ── 3. Dezgo img2img — 無検閲 ──
+    if dezgo.api_key:
+        try:
+            logger.info(f"[Undress] Trying Dezgo img2img")
+            img_bytes = dezgo.img2img(edit_prompt, img_path,
+                                      negative_prompt=edit_negative, strength=strength, seed=s)
+            if img_bytes:
+                img = decode_dezgo_image(img_bytes)
+                if img:
+                    path = save_image_to_dir(img, output_dir, prefix="undress_dezgo")
+                    return [img], f"[Dezgo 無検閲 img2img] {undress_mode}\n保存先: {path}"
+        except Exception as e:
+            errors.append(f"Dezgo img2img: {e}")
+
+    # ── 4. Fallback: 元画像のプロンプトでtxt2img再生成 ──
+    try:
+        return _adult_generate_image(edit_prompt, edit_negative, seed=s, prefix="undress_regen")
+    except Exception as e:
+        errors.append(f"txt2img fallback: {e}")
+
+    error_detail = "\n".join(errors)
+    raise gr.Error(f"編集失敗:\n{error_detail}\n\n推奨: Novita.ai / Dezgo / Vast.ai ComfyUI のAPIキーを設定してください。")
+
+
+def generate_undress_video(image, undress_mode, custom_prompt, duration):
+    """Generate undress video/GIF from image. Auto-fallback: fal.ai → Dezgo → ComfyUI."""
+    if image is None:
+        raise gr.Error("画像をアップロードしてください。")
+
+    edit_prompt, edit_negative, strength = get_undress_params(undress_mode)
+    if custom_prompt and custom_prompt.strip():
+        edit_prompt += ", " + custom_prompt.strip()
+
+    motion_prompts = {
+        "全脱衣 (ヌードに)": "slowly removing all clothing, undressing, strip tease, smooth motion",
+        "トップレスに": "slowly removing top, taking off shirt, revealing breasts, smooth motion",
+        "ランジェリーに変更": "changing into lingerie, putting on lace underwear, smooth motion",
+        "ビキニに変更": "changing into bikini, putting on swimsuit, smooth motion",
+        "服を透けさせる": "clothes becoming wet and transparent, water splashing, see through, smooth motion",
+        "服を破る (ダメージ)": "clothes tearing apart, fabric ripping, battle damage reveal, dramatic motion",
+        "エプロンのみに": "removing clothes leaving only apron, undressing to apron, smooth motion",
+        "タオル一枚に": "stepping out of shower wrapped in towel, towel slowly slipping, smooth motion",
+    }
+    video_prompt = motion_prompts.get(undress_mode, "slowly undressing, smooth motion")
+    full_prompt = f"{edit_prompt}, {video_prompt}"
+    dur = int(duration) if duration else 5
+    errors = []
+
+    # ── 1. fal.ai (Wan NSFW OK) ──
+    if fal.api_key:
+        try:
+            model_key = "Wan 2.6 img2vid (最新・NSFW OK)"
+            return generate_fal_img2vid(image, full_prompt, model_key, "adult", dur)
+        except Exception as e:
+            errors.append(f"fal.ai: {e}")
+            # Try Wan 2.1 as fallback
+            try:
+                model_key = "Wan 2.1 img2vid (高品質・NSFW OK)"
+                return generate_fal_img2vid(image, full_prompt, model_key, "adult", dur)
+            except Exception as e2:
+                errors.append(f"fal.ai Wan2.1: {e2}")
+
+    # ── 2. Dezgo txt2vid (画像は使えないがプロンプトで生成) ──
+    if dezgo.api_key:
+        try:
+            return generate_dezgo_video(full_prompt, "Wan 2.6 (最新・高品質動画)", "adult")
+        except Exception as e:
+            errors.append(f"Dezgo: {e}")
+
+    error_detail = "\n".join(errors) if errors else "動画生成に使えるAPIキーがありません"
+    raise gr.Error(f"Undress動画生成失敗:\n{error_detail}\n\nfal.ai / Dezgo のAPIキーを設定してください。")
+
+
+def generate_adult_video(scene_key, custom_addition, from_image, seed,
+                         model_sel="(自動)", lora1="None", lora1_str=0.8):
+    """Generate adult video from scene preset. Auto-fallback: fal.ai → Dezgo → Replicate → ComfyUI."""
+    prompt, negative, duration = compose_video_prompt(scene_key, custom_addition)
+    if not prompt.strip():
+        raise gr.Error("シーンを選択してください。")
+
+    errors = []
+    s = int(seed) if seed is not None else -1
+
+    # ── 1. fal.ai (Wan NSFW OK) ──
+    if fal.api_key:
+        try:
+            if from_image is not None:
+                model_key = "Wan 2.6 img2vid (最新・NSFW OK)"
+                return generate_fal_img2vid(from_image, prompt, model_key, "adult", duration)
+            else:
+                model_key = "Wan 2.6 txt2vid (最新・NSFW OK)"
+                video_path, info = generate_fal_video(prompt, model_key, "adult",
+                                                       duration=duration, negative_prompt=negative, seed=s)
+                return _gradio_safe_video(video_path), info
+        except Exception as e:
+            errors.append(f"fal.ai: {e}")
+            logger.error(f"Adult video fal.ai failed: {e}")
+
+    # ── 2. Dezgo (無検閲) ──
+    if dezgo.api_key:
+        try:
+            return generate_dezgo_video(prompt, "Wan 2.6 (最新・高品質動画)", "adult")
+        except Exception as e:
+            errors.append(f"Dezgo: {e}")
+            logger.error(f"Adult video Dezgo failed: {e}")
+
+    # ── 3. Replicate ──
+    if replicate.api_key:
+        try:
+            replicate_models = list(REPLICATE_VIDEO_MODELS.keys())
+            if replicate_models:
+                return generate_replicate_video(prompt, replicate_models[0], "adult")
+        except Exception as e:
+            errors.append(f"Replicate: {e}")
+            logger.error(f"Adult video Replicate failed: {e}")
+
+    # ── 4. ComfyUI AnimateDiff (ローカル/Vast.ai) ──
+    if client.is_server_running() and from_image is None:
+        try:
+            remote_models = client.get_models()
+            if not remote_models:
+                remote_models = _get_models_for_backend()
+            if model_sel and model_sel not in ("(自動)", ""):
+                model_name = model_sel
+            else:
+                model_name = _select_nsfw_model(remote_models)
+            # Build LoRA list
+            vid_loras = []
+            if lora1 and lora1 not in ("None", "なし", ""):
+                vid_loras.append((lora1, float(lora1_str)))
+            workflow = build_animatediff_workflow(
+                prompt, negative, model_name,
+                motion_model="mm_sd_v15_v2.ckpt",
+                width=512, height=512, steps=20, cfg=7.0,
+                sampler="euler_ancestral", scheduler="normal",
+                seed=s, frame_count=16, fps=8,
+                loras=vid_loras,
+            )
+            frames, video_path = client.generate_video(workflow, config["output_dir_adult"])
+            if video_path:
+                lora_info = f"\nLoRA: {', '.join(f'{n} ({s})' for n, s in vid_loras)}" if vid_loras else ""
+                return _gradio_safe_video(video_path), f"[ComfyUI AnimateDiff 無検閲] {model_name}{lora_info}\n保存先: {video_path}"
+        except Exception as e:
+            errors.append(f"ComfyUI AnimateDiff: {e}")
+            logger.error(f"Adult video ComfyUI failed: {e}")
+
+    error_detail = "\n".join(errors) if errors else "動画生成に使えるAPIキーがありません"
+    raise gr.Error(f"アダルト動画生成失敗:\n{error_detail}\n\nfal.ai / Dezgo / Replicate のAPIキーを設定してください。")
+
+
+def generate_fal_video(prompt, model_key, mode="normal", duration=None,
+                       width=None, height=None, negative_prompt="", seed=-1):
     """Generate video via fal.ai API."""
     if not fal.api_key:
         raise gr.Error("fal.ai API Key が未設定です。Settingsタブで設定してください。")
@@ -651,7 +2813,13 @@ def generate_fal_video(prompt, model_key, mode="normal"):
         raise gr.Error("プロンプトを入力してください。")
 
     try:
-        video_url = fal.generate_video(model_key, prompt)
+        dur = int(duration) if duration else None
+        w = int(width) if width else None
+        h = int(height) if height else None
+        s = int(seed) if seed is not None else -1
+        video_url = fal.generate_video(model_key, prompt,
+                                       negative_prompt=negative_prompt,
+                                       duration=dur, width=w, height=h, seed=s)
         if not video_url:
             raise RuntimeError("動画URLが取得できませんでした")
 
@@ -660,16 +2828,27 @@ def generate_fal_video(prompt, model_key, mode="normal"):
         import datetime as dt
         ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         video_path = os.path.join(output_dir, f"fal_video_{ts}.mp4")
-        req = urllib.request.Request(video_url, headers={"User-Agent": "AI-diffusion/1.0"})
-        resp = urllib.request.urlopen(req, timeout=120)
-        with open(video_path, "wb") as f:
-            f.write(resp.read())
+        download_fal_video(video_url, video_path)
 
         from fal_api import FAL_VIDEO_MODELS as FVM
-        cost = FVM.get(model_key, {}).get("cost", "?")
-        return video_path, f"[fal.ai {model_key}] コスト: {cost}\n保存先: {video_path}"
+        model_info = FVM.get(model_key, {})
+        cost = model_info.get("cost", "?")
+        dur_info = f" | {dur}秒" if dur else ""
+        return _gradio_safe_video(video_path), f"[fal.ai {model_key}] コスト: {cost}{dur_info}\n保存先: {video_path}"
     except Exception as e:
+        error_str = str(e)
         logger.error(f"fal.ai動画生成エラー: {traceback.format_exc()}")
+        if "content_policy_violation" in error_str:
+            if dezgo.api_key:
+                logger.info("fal.ai NSFWブロック → Dezgo にフォールバック")
+                return generate_dezgo_video(prompt, "Wan 2.6 (最新・高品質動画)", mode)
+            raise gr.Error(
+                "fal.aiがNSFWコンテンツをブロックしました。\n\n"
+                "対策:\n"
+                "1. Dezgo API Key を設定すると自動でDezgo (無検閲) にフォールバックします\n"
+                "2. ローカル AnimateDiff を使う (遅いがNSFW制限なし)\n"
+                "3. AI動画 (Dezgo) タブを直接使う"
+            )
         raise gr.Error(f"fal.ai動画生成エラー: {e}")
 
 
@@ -690,7 +2869,7 @@ def generate_dezgo_video(prompt, model_key, mode="normal"):
         with open(video_path, "wb") as f:
             f.write(mp4_bytes)
         cost = DEZGO_VIDEO_MODELS.get(model_key, {}).get("cost", "?")
-        return video_path, f"[Dezgo {model_key}] コスト: {cost}\n保存先: {video_path}"
+        return _gradio_safe_video(video_path), f"[Dezgo {model_key}] コスト: {cost}\n保存先: {video_path}"
     except Exception as e:
         logger.error(f"Dezgo動画生成エラー: {traceback.format_exc()}")
         raise gr.Error(f"Dezgo動画生成エラー: {e}")
@@ -759,7 +2938,7 @@ def generate_replicate_video(prompt, model_key, mode="normal"):
 
         model_info = REPLICATE_VIDEO_MODELS.get(model_key, {})
         cost = model_info.get("cost_per_video", "?")
-        return video_path, f"[Replicate {model_key}] コスト: {cost}\n保存先: {video_path}"
+        return _gradio_safe_video(video_path), f"[Replicate {model_key}] コスト: {cost}\n保存先: {video_path}"
     except Exception as e:
         logger.error(f"Replicate動画生成エラー: {traceback.format_exc()}")
         raise gr.Error(f"Replicate動画生成エラー: {e}")
@@ -812,12 +2991,14 @@ def generate_video_vid2vid(video_file, prompt, neg, model, motion_model, vae,
 # Settings functions
 # ──────────────────────────────────────────────
 
-def save_settings(output_normal, output_adult, gdrive_path, comfyui_url, runpod_api_key, backend_choice,
+def save_settings(output_normal, output_adult, gdrive_path, icloud_path, comfyui_url, runpod_api_key, backend_choice,
                    replicate_api_key, fal_api_key, together_api_key, dezgo_api_key, novita_api_key,
-                   civitai_api_key, anthropic_api_key, openai_api_key, xai_api_key):
+                   civitai_api_key, anthropic_api_key, openai_api_key, xai_api_key,
+                   vast_api_key=""):
     config["output_dir_normal"] = output_normal
     config["output_dir_adult"] = output_adult
     config["google_drive_models_dir"] = gdrive_path
+    config["icloud_models_dir"] = icloud_path
     config["comfyui_url"] = comfyui_url
     config["runpod_api_key"] = runpod_api_key
     config["backend"] = backend_choice
@@ -830,9 +3011,11 @@ def save_settings(output_normal, output_adult, gdrive_path, comfyui_url, runpod_
     config["anthropic_api_key"] = anthropic_api_key
     config["openai_api_key"] = openai_api_key
     config["xai_api_key"] = xai_api_key
+    config["vast_api_key"] = vast_api_key
     save_config(config)
     client.server_url = comfyui_url.rstrip("/")
     runpod.api_key = runpod_api_key
+    vastai.set_key(vast_api_key)
     replicate.api_key = replicate_api_key
     fal.set_key(fal_api_key)
     together.set_key(together_api_key)
@@ -859,6 +3042,24 @@ def switch_backend(choice):
             "Replicate に切り替えました!\n"
             "プロンプトを入力して生成できます。\n"
             "在庫切れなし・Pod管理不要・従量課金。"
+        ), ""
+
+    # ── Vast.ai (CivitAI models, full freedom) ──
+    if choice == "vast":
+        save_config(config)
+        url = config.get("vast_comfyui_url")
+        if url:
+            config["comfyui_url"] = url
+            client.server_url = url
+            save_config(config)
+            return (
+                f"Vast.ai に切り替えました!\n"
+                f"ComfyUI URL: {url}\n"
+                f"CivitAIモデル自由使用可能。SDXL/Pony対応。"
+            ), url
+        return (
+            "Vast.ai に切り替えましたが、ComfyUIが未接続です。\n"
+            "Settingsタブで「状態確認/接続」を実行してください。"
         ), ""
 
     # ── fal.ai (Flux + NSFW OK) ──
@@ -1149,6 +3350,36 @@ def civitai_generate_cloud(prompt, negative_prompt, model_key, version_id_custom
         raise gr.Error("プロンプトを入力してください。")
 
     try:
+        # iCloudモデルが選ばれた場合: URN解決してクラウド生成
+        if model_key and model_key.startswith("[iCloud] "):
+            icloud_filename = model_key[len("[iCloud] "):]
+            urn_info = civitai.resolve_icloud_model_urn(icloud_filename)
+            if not urn_info:
+                raise gr.Error(f"CivitAIでモデルが見つかりません: {icloud_filename}")
+            if urn_info.get("type", "").lower() == "lora":
+                raise gr.Error(f"{icloud_filename} はLoRAです。Checkpointモデルを選択してください。")
+
+            urls = civitai.generate_image_by_urn(
+                model_urn=urn_info["urn"], base_model=urn_info["base"],
+                prompt=prompt, negative_prompt=negative_prompt,
+                width=int(width), height=int(height),
+                steps=int(steps), cfg_scale=float(cfg),
+                seed=int(seed), quantity=int(quantity),
+            )
+            model_name = f"{urn_info['name']} ({urn_info.get('version', '')})"
+
+            images = []
+            saved_paths = []
+            output_dir = config["output_dir_adult"]
+            for url in urls:
+                img = download_url_to_pil(url)
+                images.append(img)
+                path = save_image_to_dir(img, output_dir, prefix="civitai_icloud")
+                saved_paths.append(path)
+
+            cost = urn_info.get("cost", "~4 Buzz")
+            return images, f"[CivitAI iCloud: {model_name}] コスト: {cost}/枚\n保存先: {', '.join(saved_paths)}"
+
         # If custom version ID is provided, use it; otherwise use preset
         if version_id_custom and version_id_custom.strip():
             vid = version_id_custom.strip()
@@ -1202,51 +3433,174 @@ def civitai_generate_cloud(prompt, negative_prompt, model_key, version_id_custom
         raise gr.Error(f"CivitAI生成エラー: {e}")
 
 
+# Google Drive model directories (A1111/Forge format -> ComfyUI format)
+GDRIVE_MODELS_BASE = os.path.expanduser(
+    "~/Library/CloudStorage/GoogleDrive-japanesebusinessman4@gmail.com/マイドライブ/AI_PICS/models"
+)
+GDRIVE_DEST_MAP = {
+    "Checkpoint": "Stable-diffusion",
+    "LoRA": "Lora",
+    "VAE": "VAE",
+    "ControlNet": "ControlNet",
+    "Upscaler": "ESRGAN",
+    "Embedding": "embeddings",
+}
+LOCAL_DEST_MAP = {
+    "Checkpoint": "checkpoints",
+    "LoRA": "loras",
+    "VAE": "vae",
+    "ControlNet": "controlnet",
+    "Upscaler": "upscale_models",
+    "Embedding": "embeddings",
+}
+
+
 def civitai_download(version_id, model_type_dest):
-    """Download model from CivitAI by version ID. Returns (status, *refreshed_dropdowns)."""
+    """Download model from CivitAI by version ID. Saves to Google Drive + creates symlink."""
     if not version_id:
         return ("Version ID を入力してください（検索結果に表示されます）",) + refresh_all_model_dropdowns()
 
-    dest_map = {
-        "Checkpoint": "checkpoints",
-        "LoRA": "loras",
-        "VAE": "vae",
-        "ControlNet": "controlnet",
-        "Upscaler": "upscale_models",
-        "Embedding": "embeddings",
-    }
-    dest_dir = os.path.join(config["models_dir"], dest_map.get(model_type_dest, "checkpoints"))
-    os.makedirs(dest_dir, exist_ok=True)
+    local_subdir = LOCAL_DEST_MAP.get(model_type_dest, "checkpoints")
+    local_dir = os.path.join(config["models_dir"], local_subdir)
+    os.makedirs(local_dir, exist_ok=True)
+
+    # Determine download destination: Google Drive if available, else local
+    gdrive_subdir = GDRIVE_DEST_MAP.get(model_type_dest, "Stable-diffusion")
+    gdrive_dir = os.path.join(GDRIVE_MODELS_BASE, gdrive_subdir)
+    use_gdrive = os.path.isdir(GDRIVE_MODELS_BASE)
+
+    if use_gdrive:
+        os.makedirs(gdrive_dir, exist_ok=True)
+        dest_dir = gdrive_dir
+    else:
+        dest_dir = local_dir
 
     try:
         info = civitai.get_download_url(int(version_id))
         if not info:
             return ("ダウンロードURLが見つかりません",) + refresh_all_model_dropdowns()
         size_gb = info["size_kb"] / 1024 / 1024
-        filepath = civitai.download_model(int(version_id), dest_dir)
-        msg = f"✅ ダウンロード完了!\nFile: {os.path.basename(filepath)}\nSize: {size_gb:.1f}GB\nPath: {filepath}\n\n全タブのモデルリストを自動更新しました"
+
+        if use_gdrive:
+            # Download to local temp first, then move to Google Drive (avoids sync conflicts)
+            import tempfile
+            tmp_dir = os.path.join(tempfile.gettempdir(), "ai-diffusion-dl")
+            os.makedirs(tmp_dir, exist_ok=True)
+            tmp_filepath = civitai.download_model(int(version_id), tmp_dir)
+            filename = os.path.basename(tmp_filepath)
+            filepath = os.path.join(gdrive_dir, filename)
+            shutil.move(tmp_filepath, filepath)
+
+            # Create symlinks
+            symlink_path = os.path.join(local_dir, filename)
+            if not os.path.exists(symlink_path):
+                os.symlink(filepath, symlink_path)
+            comfyui_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "comfyui", "models", local_subdir)
+            os.makedirs(comfyui_dir, exist_ok=True)
+            comfyui_link = os.path.join(comfyui_dir, filename)
+            if not os.path.exists(comfyui_link):
+                os.symlink(filepath, comfyui_link)
+            storage_info = "💾 Google Drive に保存 (Mac容量を消費しません)"
+        else:
+            filepath = civitai.download_model(int(version_id), local_dir)
+            filename = os.path.basename(filepath)
+            storage_info = "⚠️ ローカルに保存 (Google Drive未接続)"
+
+        msg = (
+            f"✅ ダウンロード完了!\n"
+            f"File: {filename}\n"
+            f"Size: {size_gb:.1f}GB\n"
+            f"Path: {filepath}\n"
+            f"{storage_info}\n\n"
+            f"全タブのモデルリストを自動更新しました"
+        )
         return (msg,) + refresh_all_model_dropdowns()
     except Exception as e:
         return (f"ダウンロードエラー: {e}",) + refresh_all_model_dropdowns()
 
 
-def download_from_url(url, model_type_dest, custom_filename):
-    """Download model from direct URL (HuggingFace, etc.). Returns (status, *refreshed_dropdowns)."""
-    if not url or not url.startswith("http"):
-        return ("有効なURLを入力してください",) + refresh_all_model_dropdowns()
+def install_to_vastai(version_id_or_url, model_type_dest):
+    """Download CivitAI model directly to vast.ai ComfyUI instance.
+    For early access / new models not yet on Novita.ai.
+    """
+    comfyui_url = config.get("vast_comfyui_url") or config.get("comfyui_url", "")
+    if not comfyui_url or "127.0.0.1" in comfyui_url:
+        return "vast.ai ComfyUI が未設定です。Settingsで設定してください。"
 
-    dest_map = {
+    # Determine download URL
+    if str(version_id_or_url).startswith("http"):
+        download_url = version_id_or_url
+        filename = download_url.split("/")[-1].split("?")[0] or "model.safetensors"
+    else:
+        try:
+            info = civitai.get_download_url(int(version_id_or_url))
+            if not info:
+                return "CivitAI Version IDが見つかりません"
+            download_url = info.get("url", "")
+            filename = info.get("name", "model.safetensors")
+        except Exception as e:
+            return f"CivitAI URL取得エラー: {e}"
+
+    # Add CivitAI API key for early access models
+    if "civitai.com" in download_url and civitai.api_key:
+        sep = "&" if "?" in download_url else "?"
+        download_url += f"{sep}token={civitai.api_key}"
+
+    # Determine destination path on ComfyUI
+    subdir_map = {
         "Checkpoint": "checkpoints",
         "LoRA": "loras",
         "VAE": "vae",
-        "ControlNet": "controlnet",
-        "Upscaler": "upscale_models",
         "Embedding": "embeddings",
-        "UNET / Diffusion Model": "diffusion_models",
-        "CLIP / Text Encoder": "clip",
+        "ControlNet": "controlnet",
     }
-    dest_dir = os.path.join(config["models_dir"], dest_map.get(model_type_dest, "checkpoints"))
-    os.makedirs(dest_dir, exist_ok=True)
+    subdir = subdir_map.get(model_type_dest, "checkpoints")
+    dest_path = f"/opt/ComfyUI/models/{subdir}/{filename}"
+
+    # Use vast.ai API to exec wget on the instance
+    vast_key = config.get("vast_api_key", "")
+    instance_id = config.get("vast_instance_id")
+    if vast_key and instance_id:
+        import urllib.request
+        import json as json_mod
+        try:
+            cmd = f"wget -q -O '{dest_path}' '{download_url}'"
+            req = urllib.request.Request(
+                f"https://console.vast.ai/api/v0/instances/{instance_id}/exec/",
+                data=json_mod.dumps({"command": cmd}).encode(),
+                headers={
+                    "Authorization": f"Bearer {vast_key}",
+                    "Content-Type": "application/json",
+                },
+                method="PUT",
+            )
+            resp = urllib.request.urlopen(req, timeout=30)
+            if resp.status in (200, 201, 202):
+                return (
+                    f"✅ vast.ai ComfyUIにダウンロード開始\n"
+                    f"ファイル: {filename}\n"
+                    f"保存先: {dest_path}\n"
+                    f"大きいモデルは数分かかります。"
+                )
+        except Exception as e:
+            return f"vast.ai exec エラー: {e}"
+
+    # Fallback: try ComfyUI API upload
+    return "vast.ai APIキーまたはインスタンスIDが未設定です。Settingsで設定してください。"
+
+
+def download_from_url(url, model_type_dest, custom_filename):
+    """Download model from direct URL. Saves to Google Drive + creates symlink."""
+    if not url or not url.startswith("http"):
+        return ("有効なURLを入力してください",) + refresh_all_model_dropdowns()
+
+    local_subdir = LOCAL_DEST_MAP.get(model_type_dest, "checkpoints")
+    if model_type_dest == "UNET / Diffusion Model":
+        local_subdir = "diffusion_models"
+    elif model_type_dest == "CLIP / Text Encoder":
+        local_subdir = "clip"
+    local_dir = os.path.join(config["models_dir"], local_subdir)
+    os.makedirs(local_dir, exist_ok=True)
 
     # Determine filename
     if custom_filename and custom_filename.strip():
@@ -1256,18 +3610,33 @@ def download_from_url(url, model_type_dest, custom_filename):
         if not filename or "." not in filename:
             filename = "downloaded_model.safetensors"
 
-    filepath = os.path.join(dest_dir, filename)
-    if os.path.exists(filepath):
-        return (f"既にファイルが存在します: {filepath}",) + refresh_all_model_dropdowns()
+    # Google Drive destination
+    gdrive_subdir = GDRIVE_DEST_MAP.get(model_type_dest, "Stable-diffusion")
+    gdrive_dir = os.path.join(GDRIVE_MODELS_BASE, gdrive_subdir)
+    use_gdrive = os.path.isdir(GDRIVE_MODELS_BASE)
+
+    # Check if already exists at final destination
+    final_path = os.path.join(gdrive_dir if use_gdrive else local_dir, filename)
+    if os.path.exists(final_path):
+        return (f"既にファイルが存在します: {final_path}",) + refresh_all_model_dropdowns()
+    # Also check symlink
+    local_link = os.path.join(local_dir, filename)
+    if os.path.exists(local_link):
+        return (f"既にファイルが存在します: {local_link}",) + refresh_all_model_dropdowns()
 
     try:
+        import tempfile
+        # Always download to local temp first (fast, no sync conflicts)
+        tmp_dir = os.path.join(tempfile.gettempdir(), "ai-diffusion-dl")
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_filepath = os.path.join(tmp_dir, filename)
+
         req = urllib.request.Request(url, headers={"User-Agent": "AI-diffusion/1.0"})
         resp = urllib.request.urlopen(req, timeout=600)
-        total = int(resp.headers.get("Content-Length", 0))
         downloaded = 0
         chunk_size = 1024 * 1024  # 1MB
 
-        with open(filepath, "wb") as f:
+        with open(tmp_filepath, "wb") as f:
             while True:
                 chunk = resp.read(chunk_size)
                 if not chunk:
@@ -1275,13 +3644,33 @@ def download_from_url(url, model_type_dest, custom_filename):
                 f.write(chunk)
                 downloaded += len(chunk)
 
+        # Move to final destination
+        if use_gdrive:
+            os.makedirs(gdrive_dir, exist_ok=True)
+            filepath = os.path.join(gdrive_dir, filename)
+            shutil.move(tmp_filepath, filepath)
+            # Create symlinks
+            if not os.path.exists(local_link):
+                os.symlink(filepath, local_link)
+            comfyui_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "comfyui", "models", local_subdir)
+            os.makedirs(comfyui_dir, exist_ok=True)
+            comfyui_link = os.path.join(comfyui_dir, filename)
+            if not os.path.exists(comfyui_link):
+                os.symlink(filepath, comfyui_link)
+            storage_info = "💾 Google Drive に保存"
+        else:
+            filepath = os.path.join(local_dir, filename)
+            shutil.move(tmp_filepath, filepath)
+            storage_info = "⚠️ ローカルに保存"
+
         size_gb = downloaded / (1024 * 1024 * 1024)
-        msg = f"✅ ダウンロード完了!\nFile: {filename}\nSize: {size_gb:.2f}GB\nPath: {filepath}\n\n全タブのモデルリストを自動更新しました"
+        msg = f"✅ ダウンロード完了!\nFile: {filename}\nSize: {size_gb:.2f}GB\nPath: {filepath}\n{storage_info}\n\n全タブのモデルリストを自動更新しました"
         return (msg,) + refresh_all_model_dropdowns()
     except Exception as e:
         # Clean up partial download
-        if os.path.exists(filepath):
-            os.remove(filepath)
+        tmp_path = os.path.join(tempfile.gettempdir(), "ai-diffusion-dl", filename)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
         return (f"ダウンロードエラー: {e}",) + refresh_all_model_dropdowns()
 
 
@@ -1375,6 +3764,55 @@ def link_google_drive(gdrive_path):
     return "リンクするファイルが見つかりませんでした。Google Driveのフォルダにcheckpoints/等のサブフォルダを作成してモデルを配置してください。"
 
 
+def link_icloud_models(icloud_path):
+    """Link iCloud CivitAI models to local models directory via symlinks."""
+    if not icloud_path or not os.path.isdir(icloud_path):
+        return "指定されたパスが存在しません"
+
+    models_dir = config["models_dir"]
+    linked = []
+
+    # 1. Scan subdirectories (checkpoints/, loras/, etc.) like Google Drive
+    for subdir in ["checkpoints", "loras", "vae", "controlnet", "embeddings", "upscale_models"]:
+        src = os.path.join(icloud_path, subdir)
+        if os.path.isdir(src):
+            os.makedirs(os.path.join(models_dir, subdir), exist_ok=True)
+            for f in os.listdir(src):
+                if f.lower().endswith((".safetensors", ".ckpt", ".pt", ".pth")):
+                    src_file = os.path.join(src, f)
+                    dst_file = os.path.join(models_dir, subdir, f)
+                    if not os.path.exists(dst_file):
+                        os.symlink(src_file, dst_file)
+                        linked.append(f)
+
+    # 2. Scan root directory (flat structure — CivitAI downloads often land here)
+    os.makedirs(os.path.join(models_dir, "checkpoints"), exist_ok=True)
+    for f in os.listdir(icloud_path):
+        if f.lower().endswith((".safetensors", ".ckpt")):
+            src_file = os.path.join(icloud_path, f)
+            if os.path.isfile(src_file):
+                dst_file = os.path.join(models_dir, "checkpoints", f)
+                if not os.path.exists(dst_file):
+                    os.symlink(src_file, dst_file)
+                    linked.append(f)
+
+    # パスを保存（リンク有無に関わらず、iCloudスキャンで使う）
+    config["icloud_models_dir"] = icloud_path
+    save_config(config)
+
+    if linked:
+        return f"✅ リンク完了 ({len(linked)}件): {', '.join(linked)}"
+
+    # 既にリンク済みのファイル数をカウント
+    existing = 0
+    for f in os.listdir(icloud_path):
+        if f.lower().endswith((".safetensors", ".ckpt")):
+            existing += 1
+    if existing > 0:
+        return f"✅ 全てリンク済み ({existing}件)。Modelドロップダウンに[iCloud]付きで表示されます。"
+    return "iCloudフォルダにsafetensorsファイルが見つかりません。CivitAIからダウンロードしてください。"
+
+
 def open_folder(path):
     if os.path.isdir(path):
         subprocess.Popen(["open", path])
@@ -1431,17 +3869,12 @@ STYLE_PRESETS = {
     },
 }
 
-QUALITY_PRESETS = {
-    "Quick Test": {"steps": 12, "cfg": 7.0, "hires": False, "batch": 1, "sampler": "euler_ancestral"},
-    "Standard": {"steps": 25, "cfg": 7.0, "hires": False, "batch": 1, "sampler": "dpmpp_2m"},
-    "High Quality": {"steps": 30, "cfg": 7.0, "hires": True, "batch": 1, "sampler": "dpmpp_2m"},
-    "Batch x4": {"steps": 20, "cfg": 7.0, "hires": False, "batch": 4, "sampler": "euler_ancestral"},
-}
+# QUALITY_PRESETS は adult_studio.py から import 済み (Draft/Standard/High/Ultra)
 
 
 def build_gen_controls(tab_name):
     """Build the common generation controls for a tab. Returns all input components."""
-    models = get_available_models(config["models_dir"])
+    models = _get_models_for_backend()
     loras = ["None"] + get_available_loras(config["models_dir"])
     vaes = ["None"] + get_available_vaes(config["models_dir"])
     upscale_models = ["None"] + get_available_upscale_models(config["models_dir"])
@@ -1455,11 +3888,18 @@ def build_gen_controls(tab_name):
             info="選ぶとプロンプト+設定が自動入力。あとから編集もOK。",
             scale=2,
         )
+        cinema_preset = gr.Dropdown(
+            choices=list(CINEMA_PRESETS.keys()),
+            value="(なし)",
+            label="Cinema Preset",
+            info="カメラ/レンズ情報をプロンプトに自動付加（ARRI, RED, Panavision等）",
+            scale=2,
+        )
         quality_mode = gr.Radio(
             choices=list(QUALITY_PRESETS.keys()),
-            value="Standard",
+            value="Standard (標準)",
             label="Quality",
-            info="Quick=速い / Standard=通常 / HQ=Hires付き / Batch=4枚",
+            info="Draft=高速 / Standard=通常 / High=Hires+顔補正 / Ultra=最高画質",
             scale=2,
         )
 
@@ -1470,15 +3910,20 @@ def build_gen_controls(tab_name):
         with gr.Column(scale=1):
             civitai_model_names = list(CIVITAI_GENERATION_MODELS.keys())
             fal_model_names = list(FAL_MODELS.keys())
+            icloud_models = get_icloud_only_models()
             backend = config.get("backend", "local")
             if backend == "fal":
                 cloud_choices = fal_model_names + civitai_model_names
                 default_val = fal_model_names[0]
                 model_info = "fal.ai: モデルを選択 / CivitAIバックエンドならCivitAIモデル"
             elif backend == "civitai":
-                cloud_choices = civitai_model_names
+                # iCloudモデルを[iCloud]プレフィックス付きで追加（重複排除）
+                icloud_set = set(icloud_models)
+                models = [m for m in models if m not in icloud_set]
+                icloud_prefixed = [f"[iCloud] {m}" for m in icloud_models]
+                cloud_choices = civitai_model_names + icloud_prefixed
                 default_val = civitai_model_names[0]
-                model_info = "CivitAIクラウドモデルが使われます"
+                model_info = "CivitAIクラウド + [iCloud]モデル対応"
             else:
                 cloud_choices = civitai_model_names
                 default_val = models[0] if models else (civitai_model_names[0] if civitai_model_names else None)
@@ -1489,7 +3934,7 @@ def build_gen_controls(tab_name):
                 value=default_val,
                 info=model_info,
             )
-            lora = gr.Dropdown(choices=loras, label="LoRA (ローカル専用)", value="None")
+            lora = gr.Dropdown(choices=loras, label="LoRA", value="None", info="ローカル/iCloud LoRA。fal.aiバックエンドではCivitAI URLから自動取得")
             lora_strength = gr.Slider(0, 2, value=0.8, step=0.05, label="LoRA Strength")
             vae = gr.Dropdown(choices=vaes, label="VAE (ローカル専用)", value="None")
 
@@ -1519,13 +3964,35 @@ def build_gen_controls(tab_name):
             label="Upscale Model (None=Latent Upscale)",
         )
 
+    with gr.Accordion("FaceDetailer (顔の自動修正)", open=False):
+        with gr.Row():
+            face_detailer = gr.Checkbox(label="FaceDetailer 有効", value=False)
+            face_denoise = gr.Slider(0.1, 0.7, value=0.4, step=0.05, label="顔Denoise (低い=元に忠実)")
+            face_guide_size = gr.Slider(256, 1024, value=512, step=64, label="顔ガイドサイズ")
+
     with gr.Row():
         generate_btn = gr.Button(f"Generate ({tab_name})", variant="primary", size="lg")
         refresh_btn = gr.Button("Refresh Models", size="sm")
 
     with gr.Row():
+        color_grade = gr.Dropdown(
+            choices=list(COLOR_GRADE_PRESETS.keys()),
+            value="(なし)",
+            label="Color Grade (ポストプロダクション)",
+            info="生成後の画像にカラーグレーディングを適用",
+            scale=1,
+        )
+    with gr.Row():
         gallery = gr.Gallery(label="Generated Images", columns=2, height=512)
     info = gr.Textbox(label="Info", interactive=False)
+
+    with gr.Accordion("Refine (生成後ワンクリック高画質化)", open=False):
+        gr.Markdown("生成画像を選択 → Refineで **アップスケール + 軽いdenoise + 顔補正** を一括適用。")
+        with gr.Row():
+            refine_denoise = gr.Slider(0.15, 0.55, value=0.35, step=0.05, label="Refine Denoise (低い=元に忠実)")
+            refine_scale = gr.Slider(1.25, 2.0, value=1.5, step=0.25, label="Upscale倍率")
+            refine_face = gr.Checkbox(label="顔補正", value=True)
+        refine_btn = gr.Button("Refine Selected Image", variant="secondary", size="lg")
 
     # ── Style Preset handler ──
     def apply_style(style_name):
@@ -1551,19 +4018,28 @@ def build_gen_controls(tab_name):
 
     # ── Quality Mode handler ──
     def apply_quality(mode):
-        p = QUALITY_PRESETS.get(mode, QUALITY_PRESETS["Standard"])
+        p = QUALITY_PRESETS.get(mode, QUALITY_PRESETS["Standard (標準)"])
         return (
-            gr.update(value=p["steps"]),
-            gr.update(value=p["cfg"]),
-            gr.update(value=p["batch"]),
-            gr.update(value=p["sampler"]),
-            gr.update(value=p["hires"]),
+            gr.update(value=p.get("steps", 25)),
+            gr.update(value=p.get("cfg", 7.0)),
+            gr.update(value=p.get("sampler", "dpmpp_2m_sde")),
+            gr.update(value=p.get("scheduler", "karras")),
+            gr.update(value=p.get("hires_fix", False)),
+            gr.update(value=p.get("hires_scale", 1.5)),
+            gr.update(value=p.get("hires_denoise", 0.5)),
+            gr.update(value=p.get("hires_steps", 15)),
+            gr.update(value=p.get("upscale_model", "4x-UltraSharp.pth") if p.get("hires_fix") else "None"),
+            gr.update(value=p.get("face_detailer", False)),
+            gr.update(value=p.get("face_denoise", 0.4)),
+            gr.update(value=p.get("face_guide_size", 512)),
         )
 
     quality_mode.change(
         fn=apply_quality,
         inputs=[quality_mode],
-        outputs=[steps, cfg, batch_size, sampler, hires_fix],
+        outputs=[steps, cfg, sampler, scheduler,
+                 hires_fix, hires_scale, hires_denoise, hires_steps, upscale_model_dd,
+                 face_detailer, face_denoise, face_guide_size],
     )
 
     # ── Model auto-size ──
@@ -1582,9 +4058,23 @@ def build_gen_controls(tab_name):
         outputs=[model, lora, vae],
     )
 
+    # ── Refine handler ──
+    _tab_mode = "adult" if "Adult" in tab_name else "normal"
+
+    def _do_refine(gallery_sel, p, neg, mdl, sd, dn, sc, fc):
+        return refine_image(gallery_sel, p, neg, mdl, sd, denoise=dn, upscale_scale=sc, face_fix=fc, mode=_tab_mode)
+
+    refine_btn.click(
+        fn=_do_refine,
+        inputs=[gallery, prompt, negative, model, seed, refine_denoise, refine_scale, refine_face],
+        outputs=[gallery, info],
+    )
+
     return (prompt, negative, model, lora, lora_strength, vae,
             width, height, steps, cfg, sampler, scheduler, seed, batch_size,
             hires_fix, hires_scale, hires_denoise, hires_steps, upscale_model_dd,
+            face_detailer, face_denoise, face_guide_size,
+            cinema_preset, color_grade,
             generate_btn, gallery, info)
 
 
@@ -1599,10 +4089,10 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
     with gr.Row():
         status = gr.Textbox(value=check_server_status(), label="Server Status", interactive=False, elem_classes="status-bar", scale=3)
         backend_radio = gr.Radio(
-            choices=["fal", "replicate", "together", "dezgo", "novita", "civitai", "local"],
+            choices=["vast", "fal", "replicate", "together", "dezgo", "novita", "civitai", "local"],
             value=config.get("backend", "local"),
             label="Backend",
-            info="fal=Flux推奨 / replicate=万能 / together=LoRA / dezgo=無検閲 / novita=最安 / civitai=SDXL / local=Mac",
+            info="vast=CivitAIモデル自由・無検閲 / fal=Flux / replicate=万能 / dezgo=無検閲 / novita=最安 / civitai=SDXL / local=Mac",
             scale=1,
         )
         refresh_status_btn = gr.Button("Check Server", size="sm", scale=0)
@@ -1623,13 +4113,17 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
             (q_prompt, q_neg, q_model, q_lora, q_lora_str, q_vae,
              q_w, q_h, q_steps, q_cfg, q_sampler, q_sched, q_seed, q_batch,
              q_hires, q_hires_scale, q_hires_denoise, q_hires_steps, q_upscale_model,
+             q_face_detailer, q_face_denoise, q_face_guide_size,
+             q_cinema, q_color_grade,
              q_gen_btn, q_gallery, q_info) = build_gen_controls("Normal")
 
             q_gen_btn.click(
                 fn=generate_normal,
                 inputs=[q_prompt, q_neg, q_model, q_lora, q_lora_str, q_vae,
                         q_w, q_h, q_steps, q_cfg, q_sampler, q_sched, q_seed, q_batch,
-                        q_hires, q_hires_scale, q_hires_denoise, q_hires_steps, q_upscale_model],
+                        q_hires, q_hires_scale, q_hires_denoise, q_hires_steps, q_upscale_model,
+                        q_face_detailer, q_face_denoise, q_face_guide_size,
+                        q_cinema, q_color_grade],
                 outputs=[q_gallery, q_info],
             )
 
@@ -1643,33 +4137,797 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
 
         # ── Adult (R18) Tab ──
         with gr.Tab("Adult (R18)", elem_id="adult-tab"):
-            gr.Markdown("**R18 / Adult コンテンツ生成** — 制限なし。出力は専用フォルダに保存されます。")
-            (a_prompt, a_neg, a_model, a_lora, a_lora_str, a_vae,
-             a_w, a_h, a_steps, a_cfg, a_sampler, a_sched, a_seed, a_batch,
-             a_hires, a_hires_scale, a_hires_denoise, a_hires_steps, a_upscale_model,
-             a_gen_btn, a_gallery, a_info) = build_gen_controls("Adult")
+            gr.Markdown("**R18 / Adult Studio** — 制限なし。キャラビルダー・シーン・体位選択・編集・動画。出力は専用フォルダ。")
 
-            a_gen_btn.click(
-                fn=generate_adult,
-                inputs=[a_prompt, a_neg, a_model, a_lora, a_lora_str, a_vae,
-                        a_w, a_h, a_steps, a_cfg, a_sampler, a_sched, a_seed, a_batch,
-                        a_hires, a_hires_scale, a_hires_denoise, a_hires_steps, a_upscale_model],
-                outputs=[a_gallery, a_info],
-            )
+            with gr.Tabs():
+                # ── Sub-tab 1: Free (既存の自由入力) ──
+                with gr.Tab("Free (自由入力)"):
+                    (a_prompt, a_neg, a_model, a_lora, a_lora_str, a_vae,
+                     a_w, a_h, a_steps, a_cfg, a_sampler, a_sched, a_seed, a_batch,
+                     a_hires, a_hires_scale, a_hires_denoise, a_hires_steps, a_upscale_model,
+                     a_face_detailer, a_face_denoise, a_face_guide_size,
+                     a_cinema, a_color_grade,
+                     a_gen_btn, a_gallery, a_info) = build_gen_controls("Adult")
+
+                    a_gen_btn.click(
+                        fn=generate_adult,
+                        inputs=[a_prompt, a_neg, a_model, a_lora, a_lora_str, a_vae,
+                                a_w, a_h, a_steps, a_cfg, a_sampler, a_sched, a_seed, a_batch,
+                                a_hires, a_hires_scale, a_hires_denoise, a_hires_steps, a_upscale_model,
+                                a_face_detailer, a_face_denoise, a_face_guide_size,
+                                a_cinema, a_color_grade],
+                        outputs=[a_gallery, a_info],
+                    )
+
+                # ── Sub-tab 2: Character Builder ──
+                with gr.Tab("Character Builder"):
+                    gr.Markdown(
+                        "**キャラクタービルダー** — 各項目を選ぶだけでプロンプト自動生成。体位・シチュエーションも選択可。"
+                    )
+
+                    with gr.Row():
+                        cb_style = gr.Dropdown(choices=list(CHAR_STYLE.keys()),
+                                               value=list(CHAR_STYLE.keys())[0], label="スタイル")
+                        cb_people = gr.Dropdown(choices=list(CHAR_PEOPLE_COUNT.keys()),
+                                                value=list(CHAR_PEOPLE_COUNT.keys())[0], label="人数")
+
+                    with gr.Accordion("外見 (Appearance)", open=True):
+                        with gr.Row():
+                            cb_ethnicity = gr.Dropdown(choices=list(CHAR_ETHNICITY.keys()),
+                                                       value=list(CHAR_ETHNICITY.keys())[0], label="民族")
+                            cb_age = gr.Dropdown(choices=list(CHAR_AGE.keys()),
+                                                  value=list(CHAR_AGE.keys())[0], label="年齢")
+                            cb_body = gr.Dropdown(choices=list(CHAR_BODY_TYPE.keys()),
+                                                   value=list(CHAR_BODY_TYPE.keys())[1], label="体型")
+                        with gr.Row():
+                            cb_breast = gr.Dropdown(choices=list(CHAR_BREAST.keys()),
+                                                     value=list(CHAR_BREAST.keys())[1], label="胸")
+                            cb_butt = gr.Dropdown(choices=list(CHAR_BUTT.keys()),
+                                                   value=list(CHAR_BUTT.keys())[0], label="お尻")
+                            cb_skin = gr.Dropdown(choices=list(CHAR_SKIN.keys()),
+                                                   value=list(CHAR_SKIN.keys())[1], label="肌")
+
+                    with gr.Accordion("髪・表情 (Hair & Expression)", open=True):
+                        with gr.Row():
+                            cb_hair_color = gr.Dropdown(choices=list(CHAR_HAIR_COLOR.keys()),
+                                                         value=list(CHAR_HAIR_COLOR.keys())[0], label="髪色")
+                            cb_hair_style = gr.Dropdown(choices=list(CHAR_HAIR_STYLE.keys()),
+                                                         value=list(CHAR_HAIR_STYLE.keys())[0], label="髪型")
+                            cb_expression = gr.Dropdown(choices=list(CHAR_EXPRESSION.keys()),
+                                                         value=list(CHAR_EXPRESSION.keys())[1], label="表情")
+
+                    with gr.Accordion("服装・ポーズ (Clothing & Pose)", open=True):
+                        with gr.Row():
+                            cb_clothing = gr.Dropdown(choices=list(CHAR_CLOTHING.keys()),
+                                                       value="全裸", label="服装 / 状態")
+                            cb_pose = gr.Dropdown(choices=list(CHAR_POSE.keys()),
+                                                   value="立ち (正面)", label="ポーズ")
+
+                    with gr.Accordion("体位 (Sex Position)", open=False):
+                        cb_position = gr.Dropdown(choices=list(SEX_POSITIONS.keys()),
+                                                   value="なし (ソロ)", label="体位")
+                        gr.Markdown("*体位を選択すると人数が自動的にカップル以上になります。*")
+
+                    with gr.Accordion("カメラ・場所 (Camera & Setting)", open=False):
+                        with gr.Row():
+                            cb_camera = gr.Dropdown(choices=list(CHAR_CAMERA.keys()),
+                                                     value=list(CHAR_CAMERA.keys())[0], label="カメラアングル")
+                            cb_setting = gr.Dropdown(choices=list(CHAR_SETTING.keys()),
+                                                      value=list(CHAR_SETTING.keys())[0], label="場所")
+
+                    cb_custom = gr.Textbox(label="追加プロンプト (自由入力)", lines=2,
+                                           placeholder="追加したい要素があれば入力。例: wet skin, biting lip, looking back")
+                    with gr.Row():
+                        cb_seed = gr.Number(value=-1, label="Seed (-1=random)", precision=0)
+                        _cb_icloud = [f"[iCloud] {m}" for m in get_icloud_only_models()]
+                        cb_civitai_model = gr.Dropdown(
+                            choices=["(自動)"] + list(CIVITAI_GENERATION_MODELS.keys()) + _cb_icloud,
+                            value="(自動)",
+                            label="CivitAI モデル / iCloud (指定時CivitAI優先)",
+                        )
+
+                    # ── Model / LoRA / VAE Selection ──
+                    _cb_models = _get_models_for_backend()
+                    _cb_loras = ["None"] + get_available_loras(config["models_dir"])
+                    _cb_vaes = ["None", "Auto"] + get_available_vaes(config["models_dir"])
+                    _cb_upscalers = ["None"] + get_available_upscale_models(config["models_dir"])
+
+                    with gr.Accordion("モデル設定 (Model / LoRA / VAE)", open=False):
+                        with gr.Row():
+                            cb_model_sel = gr.Dropdown(
+                                choices=["(自動)"] + _cb_models,
+                                value="(自動)",
+                                label="チェックポイント",
+                                info="(自動)=NSFW最適モデル自動選択。ローカル全モデルから選択可。",
+                            )
+                            cb_vae_sel = gr.Dropdown(choices=_cb_vaes, value="None", label="VAE")
+                        with gr.Row():
+                            cb_lora1 = gr.Dropdown(choices=_cb_loras, value="None", label="LoRA 1")
+                            cb_lora1_str = gr.Slider(0, 2, value=0.8, step=0.05, label="LoRA 1 強度")
+                        with gr.Row():
+                            cb_lora2 = gr.Dropdown(choices=_cb_loras, value="None", label="LoRA 2")
+                            cb_lora2_str = gr.Slider(0, 2, value=0.8, step=0.05, label="LoRA 2 強度")
+                        with gr.Row():
+                            cb_lora3 = gr.Dropdown(choices=_cb_loras, value="None", label="LoRA 3")
+                            cb_lora3_str = gr.Slider(0, 2, value=0.8, step=0.05, label="LoRA 3 強度")
+
+                    with gr.Accordion("生成設定 (Steps / CFG / Size)", open=False):
+                        with gr.Row():
+                            cb_width = gr.Slider(256, 2048, value=832, step=64, label="Width")
+                            cb_height = gr.Slider(256, 2048, value=1216, step=64, label="Height")
+                        with gr.Row():
+                            cb_steps = gr.Slider(1, 100, value=28, step=1, label="Steps")
+                            cb_cfg = gr.Slider(1, 30, value=7.5, step=0.5, label="CFG Scale")
+                        with gr.Row():
+                            cb_sampler = gr.Dropdown(choices=SAMPLERS, value="euler_ancestral", label="Sampler")
+                            cb_scheduler = gr.Dropdown(choices=SCHEDULERS, value="normal", label="Scheduler")
+
+                    cb_quality_preset = gr.Radio(
+                        choices=list(QUALITY_PRESETS.keys()),
+                        value="Standard (標準)",
+                        label="画質プリセット",
+                        info="Draft=高速 / Standard=通常 / High=Hires+顔補正 / Ultra=最高画質",
+                    )
+
+                    with gr.Accordion("Hires Fix / FaceDetailer", open=False):
+                        with gr.Row():
+                            cb_hires = gr.Checkbox(label="Hires Fix", value=False)
+                            cb_hires_scale = gr.Slider(1.25, 2.0, value=1.5, step=0.25, label="倍率")
+                            cb_hires_denoise = gr.Slider(0.2, 0.7, value=0.5, step=0.05, label="Hires Denoise")
+                            cb_hires_steps = gr.Slider(5, 30, value=15, step=1, label="Hires Steps")
+                        cb_upscale_model = gr.Dropdown(
+                            choices=_cb_upscalers,
+                            value="4x-UltraSharp.pth" if "4x-UltraSharp.pth" in _cb_upscalers else "None",
+                            label="Upscale Model",
+                        )
+                        with gr.Row():
+                            cb_face_detailer = gr.Checkbox(label="FaceDetailer", value=False)
+                            cb_face_denoise = gr.Slider(0.1, 0.7, value=0.4, step=0.05, label="顔Denoise")
+                            cb_face_guide = gr.Slider(256, 1024, value=512, step=64, label="顔ガイドサイズ")
+
+                    # Preview generated prompt
+                    cb_preview = gr.Textbox(label="生成されるプロンプト (プレビュー)", lines=3, interactive=False)
+
+                    def preview_char_prompt(style, eth, age, body, breast, butt, hc, hs, skin, expr, cloth, pose, pos, cam, sett, ppl, custom):
+                        p, n = compose_character_prompt(style, eth, age, body, breast, butt, hc, hs, skin, expr, cloth, pose, pos, cam, sett, ppl, custom)
+                        return f"[Prompt]\n{p}\n\n[Negative]\n{n}"
+
+                    _cb_inputs = [cb_style, cb_ethnicity, cb_age, cb_body, cb_breast, cb_butt,
+                                  cb_hair_color, cb_hair_style, cb_skin, cb_expression, cb_clothing,
+                                  cb_pose, cb_position, cb_camera, cb_setting, cb_people, cb_custom]
+
+                    for inp in _cb_inputs:
+                        inp.change(fn=preview_char_prompt, inputs=_cb_inputs, outputs=[cb_preview])
+
+                    # ── Quality preset handler for Character Builder ──
+                    def _cb_apply_quality(preset_key):
+                        p = QUALITY_PRESETS.get(preset_key, QUALITY_PRESETS["Standard (標準)"])
+                        return (
+                            gr.update(value=p.get("steps", 25)),
+                            gr.update(value=p.get("cfg", 7.0)),
+                            gr.update(value=p.get("sampler", "dpmpp_2m_sde")),
+                            gr.update(value=p.get("scheduler", "karras")),
+                            gr.update(value=p.get("hires_fix", False)),
+                            gr.update(value=p.get("hires_scale", 1.5)),
+                            gr.update(value=p.get("hires_denoise", 0.5)),
+                            gr.update(value=p.get("hires_steps", 15)),
+                            gr.update(value=p.get("upscale_model", "4x-UltraSharp.pth") if p.get("hires_fix") else "None"),
+                            gr.update(value=p.get("face_detailer", False)),
+                            gr.update(value=p.get("face_denoise", 0.4)),
+                            gr.update(value=p.get("face_guide_size", 512)),
+                        )
+
+                    cb_quality_preset.change(
+                        fn=_cb_apply_quality,
+                        inputs=[cb_quality_preset],
+                        outputs=[cb_steps, cb_cfg, cb_sampler, cb_scheduler,
+                                 cb_hires, cb_hires_scale, cb_hires_denoise, cb_hires_steps, cb_upscale_model,
+                                 cb_face_detailer, cb_face_denoise, cb_face_guide],
+                    )
+
+                    cb_gen_btn = gr.Button("Generate Character", variant="primary", size="lg")
+                    cb_gallery = gr.Gallery(label="Generated", columns=2, height=512)
+                    cb_info = gr.Textbox(label="Info", interactive=False)
+
+                    with gr.Accordion("Refine (生成後ワンクリック高画質化)", open=False):
+                        gr.Markdown("生成画像を選択 → Refineで **アップスケール + denoise + 顔補正** を一括適用。")
+                        with gr.Row():
+                            cb_refine_denoise = gr.Slider(0.15, 0.55, value=0.35, step=0.05, label="Denoise")
+                            cb_refine_scale = gr.Slider(1.25, 2.0, value=1.5, step=0.25, label="Upscale倍率")
+                            cb_refine_face = gr.Checkbox(label="顔補正", value=True)
+                        cb_refine_btn = gr.Button("Refine Selected Image", variant="secondary", size="lg")
+
+                    cb_gen_btn.click(
+                        fn=generate_character_image,
+                        inputs=[cb_style, cb_ethnicity, cb_age, cb_body, cb_breast, cb_butt,
+                                cb_hair_color, cb_hair_style, cb_skin, cb_expression, cb_clothing,
+                                cb_pose, cb_position, cb_camera, cb_setting, cb_people,
+                                cb_custom, cb_seed, cb_civitai_model,
+                                cb_model_sel, cb_lora1, cb_lora1_str,
+                                cb_lora2, cb_lora2_str, cb_lora3, cb_lora3_str,
+                                cb_vae_sel,
+                                cb_steps, cb_cfg, cb_sampler, cb_scheduler,
+                                cb_width, cb_height,
+                                cb_hires, cb_hires_scale, cb_hires_denoise, cb_hires_steps, cb_upscale_model,
+                                cb_face_detailer, cb_face_denoise, cb_face_guide],
+                        outputs=[cb_gallery, cb_info],
+                    )
+
+                    cb_refine_btn.click(
+                        fn=lambda g, p, sd, dn, us, ff: refine_image(g, p, "", None, sd, dn, us, ff, "adult"),
+                        inputs=[cb_gallery, cb_custom, cb_seed, cb_refine_denoise, cb_refine_scale, cb_refine_face],
+                        outputs=[cb_gallery, cb_info],
+                    )
+
+                    # Auto-apply optimal settings when model changes
+                    def _cb_apply_model_settings(model_name):
+                        settings = get_model_settings(model_name)
+                        if not settings:
+                            return [gr.update()] * 6
+                        return [
+                            gr.update(value=settings.get("steps", 28)),
+                            gr.update(value=settings.get("cfg", 7.5)),
+                            gr.update(value=settings.get("sampler", "euler_ancestral")),
+                            gr.update(value=settings.get("scheduler", "normal")),
+                            gr.update(value=settings.get("w", 832)),
+                            gr.update(value=settings.get("h", 1216)),
+                        ]
+
+                    cb_model_sel.change(
+                        fn=_cb_apply_model_settings,
+                        inputs=[cb_model_sel],
+                        outputs=[cb_steps, cb_cfg, cb_sampler, cb_scheduler, cb_width, cb_height],
+                    )
+
+                # ── Sub-tab 3: Scene Categories ──
+                with gr.Tab("Scene (ワンクリック)"):
+                    gr.Markdown(
+                        "**シーンカテゴリ** — カテゴリを選んでワンクリック生成。追加プロンプトでカスタマイズ可。"
+                    )
+
+                    sc_category = gr.Dropdown(
+                        choices=list(SCENE_CATEGORIES.keys()),
+                        value=list(SCENE_CATEGORIES.keys())[0],
+                        label="シーンカテゴリ",
+                    )
+                    sc_detail = gr.Markdown("")
+
+                    def show_scene_detail(key):
+                        s = SCENE_CATEGORIES.get(key, {})
+                        return f"**プロンプト**: {s.get('prompt', '')}\n**スタイル**: {s.get('style', '')}"
+
+                    sc_category.change(fn=show_scene_detail, inputs=[sc_category], outputs=[sc_detail])
+
+                    sc_custom = gr.Textbox(label="追加プロンプト (カスタム)", lines=2,
+                                           placeholder="例: japanese woman, long black hair, big breasts")
+                    with gr.Row():
+                        sc_seed = gr.Number(value=-1, label="Seed (-1=random)", precision=0)
+                        _sc_icloud = [f"[iCloud] {m}" for m in get_icloud_only_models()]
+                        sc_civitai_model = gr.Dropdown(
+                            choices=["(自動)"] + list(CIVITAI_GENERATION_MODELS.keys()) + _sc_icloud,
+                            value="(自動)",
+                            label="CivitAI モデル / iCloud (指定時CivitAI優先)",
+                        )
+
+                    # ── Scene Model / LoRA Selection ──
+                    _sc_models = _get_models_for_backend()
+                    _sc_loras = ["None"] + get_available_loras(config["models_dir"])
+                    _sc_vaes = ["None", "Auto"] + get_available_vaes(config["models_dir"])
+                    _sc_upscalers = ["None"] + get_available_upscale_models(config["models_dir"])
+
+                    with gr.Accordion("モデル設定 (Model / LoRA / VAE)", open=False):
+                        with gr.Row():
+                            sc_model_sel = gr.Dropdown(choices=["(自動)"] + _sc_models, value="(自動)", label="チェックポイント")
+                            sc_vae_sel = gr.Dropdown(choices=_sc_vaes, value="None", label="VAE")
+                        with gr.Row():
+                            sc_lora1 = gr.Dropdown(choices=_sc_loras, value="None", label="LoRA 1")
+                            sc_lora1_str = gr.Slider(0, 2, value=0.8, step=0.05, label="LoRA 1 強度")
+                        with gr.Row():
+                            sc_lora2 = gr.Dropdown(choices=_sc_loras, value="None", label="LoRA 2")
+                            sc_lora2_str = gr.Slider(0, 2, value=0.8, step=0.05, label="LoRA 2 強度")
+                        with gr.Row():
+                            sc_lora3 = gr.Dropdown(choices=_sc_loras, value="None", label="LoRA 3")
+                            sc_lora3_str = gr.Slider(0, 2, value=0.8, step=0.05, label="LoRA 3 強度")
+
+                    with gr.Accordion("生成設定 (Steps / CFG / Size)", open=False):
+                        with gr.Row():
+                            sc_width = gr.Slider(256, 2048, value=832, step=64, label="Width")
+                            sc_height = gr.Slider(256, 2048, value=1216, step=64, label="Height")
+                        with gr.Row():
+                            sc_steps = gr.Slider(1, 100, value=28, step=1, label="Steps")
+                            sc_cfg = gr.Slider(1, 30, value=7.5, step=0.5, label="CFG Scale")
+                        with gr.Row():
+                            sc_sampler = gr.Dropdown(choices=SAMPLERS, value="euler_ancestral", label="Sampler")
+                            sc_scheduler = gr.Dropdown(choices=SCHEDULERS, value="normal", label="Scheduler")
+
+                    sc_quality_preset = gr.Radio(
+                        choices=list(QUALITY_PRESETS.keys()),
+                        value="Standard (標準)",
+                        label="画質プリセット",
+                        info="Draft=高速 / Standard=通常 / High=Hires+顔補正 / Ultra=最高画質",
+                    )
+
+                    with gr.Accordion("Hires Fix / FaceDetailer", open=False):
+                        with gr.Row():
+                            sc_hires = gr.Checkbox(label="Hires Fix", value=False)
+                            sc_hires_scale = gr.Slider(1.25, 2.0, value=1.5, step=0.25, label="倍率")
+                            sc_hires_denoise = gr.Slider(0.2, 0.7, value=0.5, step=0.05, label="Hires Denoise")
+                            sc_hires_steps = gr.Slider(5, 30, value=15, step=1, label="Hires Steps")
+                        sc_upscale_model = gr.Dropdown(
+                            choices=_sc_upscalers,
+                            value="4x-UltraSharp.pth" if "4x-UltraSharp.pth" in _sc_upscalers else "None",
+                            label="Upscale Model",
+                        )
+                        with gr.Row():
+                            sc_face_detailer = gr.Checkbox(label="FaceDetailer", value=False)
+                            sc_face_denoise = gr.Slider(0.1, 0.7, value=0.4, step=0.05, label="顔Denoise")
+                            sc_face_guide = gr.Slider(256, 1024, value=512, step=64, label="顔ガイドサイズ")
+
+                    # ── Quality preset handler for Scene ──
+                    def _sc_apply_quality(preset_key):
+                        p = QUALITY_PRESETS.get(preset_key, QUALITY_PRESETS["Standard (標準)"])
+                        return (
+                            gr.update(value=p.get("steps", 25)),
+                            gr.update(value=p.get("cfg", 7.0)),
+                            gr.update(value=p.get("sampler", "dpmpp_2m_sde")),
+                            gr.update(value=p.get("scheduler", "karras")),
+                            gr.update(value=p.get("hires_fix", False)),
+                            gr.update(value=p.get("hires_scale", 1.5)),
+                            gr.update(value=p.get("hires_denoise", 0.5)),
+                            gr.update(value=p.get("hires_steps", 15)),
+                            gr.update(value=p.get("upscale_model", "4x-UltraSharp.pth") if p.get("hires_fix") else "None"),
+                            gr.update(value=p.get("face_detailer", False)),
+                            gr.update(value=p.get("face_denoise", 0.4)),
+                            gr.update(value=p.get("face_guide_size", 512)),
+                        )
+
+                    sc_quality_preset.change(
+                        fn=_sc_apply_quality,
+                        inputs=[sc_quality_preset],
+                        outputs=[sc_steps, sc_cfg, sc_sampler, sc_scheduler,
+                                 sc_hires, sc_hires_scale, sc_hires_denoise, sc_hires_steps, sc_upscale_model,
+                                 sc_face_detailer, sc_face_denoise, sc_face_guide],
+                    )
+
+                    sc_gen_btn = gr.Button("Generate Scene", variant="primary", size="lg")
+                    sc_gallery = gr.Gallery(label="Generated", columns=2, height=512)
+                    sc_info = gr.Textbox(label="Info", interactive=False)
+
+                    with gr.Accordion("Refine (生成後ワンクリック高画質化)", open=False):
+                        gr.Markdown("生成画像を選択 → Refineで **アップスケール + denoise + 顔補正** を一括適用。")
+                        with gr.Row():
+                            sc_refine_denoise = gr.Slider(0.15, 0.55, value=0.35, step=0.05, label="Denoise")
+                            sc_refine_scale = gr.Slider(1.25, 2.0, value=1.5, step=0.25, label="Upscale倍率")
+                            sc_refine_face = gr.Checkbox(label="顔補正", value=True)
+                        sc_refine_btn = gr.Button("Refine Selected Image", variant="secondary", size="lg")
+
+                    sc_gen_btn.click(
+                        fn=generate_scene_category,
+                        inputs=[sc_category, sc_custom, sc_seed, sc_civitai_model,
+                                sc_model_sel, sc_lora1, sc_lora1_str,
+                                sc_lora2, sc_lora2_str, sc_lora3, sc_lora3_str,
+                                sc_vae_sel,
+                                sc_steps, sc_cfg, sc_sampler, sc_scheduler,
+                                sc_width, sc_height,
+                                sc_hires, sc_hires_scale, sc_hires_denoise, sc_hires_steps, sc_upscale_model,
+                                sc_face_detailer, sc_face_denoise, sc_face_guide],
+                        outputs=[sc_gallery, sc_info],
+                    )
+
+                    sc_refine_btn.click(
+                        fn=lambda g, p, sd, dn, us, ff: refine_image(g, p, "", None, sd, dn, us, ff, "adult"),
+                        inputs=[sc_gallery, sc_custom, sc_seed, sc_refine_denoise, sc_refine_scale, sc_refine_face],
+                        outputs=[sc_gallery, sc_info],
+                    )
+
+                    # Auto-apply optimal settings when model changes
+                    def _sc_apply_model_settings(model_name):
+                        settings = get_model_settings(model_name)
+                        if not settings:
+                            return [gr.update()] * 6
+                        return [
+                            gr.update(value=settings.get("steps", 28)),
+                            gr.update(value=settings.get("cfg", 7.5)),
+                            gr.update(value=settings.get("sampler", "euler_ancestral")),
+                            gr.update(value=settings.get("scheduler", "normal")),
+                            gr.update(value=settings.get("w", 832)),
+                            gr.update(value=settings.get("h", 1216)),
+                        ]
+
+                    sc_model_sel.change(
+                        fn=_sc_apply_model_settings,
+                        inputs=[sc_model_sel],
+                        outputs=[sc_steps, sc_cfg, sc_sampler, sc_scheduler, sc_width, sc_height],
+                    )
+
+                # ── Sub-tab 4: Undress / Edit ──
+                with gr.Tab("Undress / 衣服編集"):
+                    gr.Markdown(
+                        "**Undress / 衣服編集** — 画像をアップロード → **服の部分をブラシで塗る（マスク）** → 編集モード選択 → 生成\n\n"
+                        "**マスクあり（推奨）**: 塗った部分だけ再生成。顔・体型・背景はそのまま保持。\n"
+                        "**マスクなし**: img2img で全体を再生成（元画像の保持度はdenoiseで調整）。\n\n"
+                        "ComfyUI Inpainting (Vast.ai) で完全無検閲。"
+                    )
+
+                    with gr.Row():
+                        ud_image = gr.ImageEditor(
+                            label="画像をアップロード → ブラシで服の部分を塗る",
+                            type="numpy",
+                            brush=gr.Brush(colors=["#FFFFFF"], default_size=30),
+                            height=512,
+                        )
+                        ud_result = gr.Gallery(label="結果", columns=1, height=512)
+
+                    ud_mode = gr.Dropdown(
+                        choices=list(UNDRESS_MODES.keys()),
+                        value=list(UNDRESS_MODES.keys())[0],
+                        label="編集モード",
+                    )
+                    ud_detail = gr.Markdown("")
+
+                    def show_undress_detail(key):
+                        m = UNDRESS_MODES.get(key, {})
+                        return f"**プロンプト**: {m.get('prompt', '')}\n**強度**: {m.get('strength', 0.7)}"
+
+                    ud_mode.change(fn=show_undress_detail, inputs=[ud_mode], outputs=[ud_detail])
+
+                    ud_custom = gr.Textbox(label="追加プロンプト", lines=1,
+                                           placeholder="例: red lace lingerie, black stockings")
+                    with gr.Row():
+                        ud_seed = gr.Number(value=-1, label="Seed (-1=random)", precision=0)
+                        ud_denoise = gr.Slider(0.2, 1.0, value=0.75, step=0.05,
+                                               label="Denoise強度 (低い=元画像保持、高い=大きく変更)")
+
+                    # ── Undress Model Selection ──
+                    _ud_models = _get_models_for_backend()
+                    _ud_loras = ["None"] + get_available_loras(config["models_dir"])
+
+                    with gr.Accordion("モデル設定", open=False):
+                        with gr.Row():
+                            ud_model_sel = gr.Dropdown(choices=["(自動)"] + _ud_models, value="(自動)", label="チェックポイント")
+                        with gr.Row():
+                            ud_lora1 = gr.Dropdown(choices=_ud_loras, value="None", label="LoRA")
+                            ud_lora1_str = gr.Slider(0, 2, value=0.8, step=0.05, label="LoRA 強度")
+
+                    with gr.Row():
+                        ud_gen_btn = gr.Button("Edit / Undress (画像)", variant="primary", size="lg")
+                        ud_vid_btn = gr.Button("Undress動画 / GIF生成", variant="secondary", size="lg")
+
+                    ud_info = gr.Textbox(label="Info", interactive=False)
+
+                    with gr.Accordion("動画設定", open=False):
+                        ud_duration = gr.Slider(3, 10, value=5, step=1, label="動画の長さ (秒)")
+                        ud_video_out = gr.Video(label="Undress動画", height=400)
+                        gr.Markdown(
+                            "*画像をアップロード → 編集モード選択 → 「Undress動画」で脱衣アニメーション生成*\n"
+                            "*fal.ai Wan 2.6 (NSFW OK) を使用。*"
+                        )
+
+                    ud_gen_btn.click(
+                        fn=generate_undress_edit,
+                        inputs=[ud_image, ud_mode, ud_custom, ud_seed, ud_denoise,
+                                ud_model_sel, ud_lora1, ud_lora1_str],
+                        outputs=[ud_result, ud_info],
+                    )
+
+                    ud_vid_btn.click(
+                        fn=generate_undress_video,
+                        inputs=[ud_image, ud_mode, ud_custom, ud_duration],
+                        outputs=[ud_video_out, ud_info],
+                    )
+
+                # ── Sub-tab 5: Adult Video ──
+                with gr.Tab("Adult Video"):
+                    gr.Markdown(
+                        "**アダルト動画生成** — シーンプリセットから動画生成。画像アップロードでimg2vidも対応。\n\n"
+                        "fal.ai Wan 2.6 (NSFW OK) を使用。"
+                    )
+
+                    av_scene = gr.Dropdown(
+                        choices=list(ADULT_VIDEO_SCENES.keys()),
+                        value=list(ADULT_VIDEO_SCENES.keys())[0],
+                        label="動画シーン",
+                    )
+                    av_detail = gr.Markdown("")
+
+                    def show_av_detail(key):
+                        s = ADULT_VIDEO_SCENES.get(key, {})
+                        return f"**プロンプト**: {s.get('prompt', '')}\n**長さ**: {s.get('duration', 5)}秒"
+
+                    av_scene.change(fn=show_av_detail, inputs=[av_scene], outputs=[av_detail])
+
+                    av_custom = gr.Textbox(label="追加プロンプト", lines=2,
+                                           placeholder="例: japanese woman, bedroom, passionate")
+                    av_image = gr.Image(label="参照画像 (img2vid / 省略可)", type="numpy")
+                    av_seed = gr.Number(value=-1, label="Seed (-1=random)", precision=0)
+
+                    # ── Adult Video Model Selection ──
+                    _av_models = _get_models_for_backend()
+                    _av_loras = ["None"] + get_available_loras(config["models_dir"])
+
+                    with gr.Accordion("モデル設定 (AnimateDiff用)", open=False):
+                        with gr.Row():
+                            av_model_sel = gr.Dropdown(choices=["(自動)"] + _av_models, value="(自動)",
+                                                        label="チェックポイント (AnimateDiff用、SD1.5のみ)")
+                        with gr.Row():
+                            av_lora1 = gr.Dropdown(choices=_av_loras, value="None", label="LoRA")
+                            av_lora1_str = gr.Slider(0, 2, value=0.8, step=0.05, label="LoRA 強度")
+                        gr.Markdown("*AnimateDiffはSD1.5モデルのみ対応。SDXLモデルでは動作しません。*")
+
+                    av_gen_btn = gr.Button("Generate Adult Video", variant="primary", size="lg")
+                    av_video = gr.Video(label="Generated Video", height=400)
+                    av_info = gr.Textbox(label="Info", interactive=False)
+
+                    av_gen_btn.click(
+                        fn=generate_adult_video,
+                        inputs=[av_scene, av_custom, av_image, av_seed,
+                                av_model_sel, av_lora1, av_lora1_str],
+                        outputs=[av_video, av_info],
+                    )
+
+                # ── Sub-tab 5.5: Wan 2.2 NSFW Lightning (専用バックエンド) ──
+                with gr.Tab("🔥 Wan 2.2 NSFW Lightning"):
+                    gr.Markdown(
+                        "**Wan 2.2 Enhanced NSFW (SVI Lightning Edition)** — 完全無検閲、カメラプロンプト対応の最新動画モデル。\n\n"
+                        "• **2-stage MoE**: HIGH-noise → LOW-noise GGUF pair\n"
+                        "• **Lightning**: 4 steps で生成（通常の5倍速）\n"
+                        "• **専用バックエンド**: RTX 3090 24GB (vast.ai) — 重いので通常生成とは別\n"
+                        "• **T2V / I2V** 両対応\n"
+                        "• 1回あたり約30秒〜2分（5秒動画）\n\n"
+                        "⚠️ セットアップ中の場合は Settings → `wan22_comfyui_url` を確認"
+                    )
+
+                    with gr.Tabs():
+                        # ── Wan 2.2 T2V ──
+                        with gr.Tab("T2V (テキスト→動画)"):
+                            gr.Markdown("プロンプトから完全無検閲動画を生成。camera prompt対応（slow push-in, pan, orbit 等）")
+
+                            with gr.Row():
+                                with gr.Column(scale=2):
+                                    w22_t_prompt = gr.Textbox(
+                                        label="Prompt (英語推奨)",
+                                        lines=4,
+                                        placeholder="例: beautiful woman, undressing slowly, soft lighting, slow cinematic push-in camera, intimate",
+                                    )
+                                    w22_t_neg = gr.Textbox(
+                                        label="Negative Prompt",
+                                        lines=2,
+                                        value="worst quality, blurry, static, jittery, distorted, deformed anatomy, bad hands",
+                                    )
+                                with gr.Column(scale=1):
+                                    w22_t_duration = gr.Slider(
+                                        1, 15, value=5, step=1,
+                                        label="Duration (秒) / 動画の長さ",
+                                        info="Wan2.2は4N+1フレーム構成 (16fps)",
+                                    )
+                                    w22_t_w = gr.Slider(512, 1280, value=832, step=16, label="Width")
+                                    w22_t_h = gr.Slider(384, 720, value=480, step=16, label="Height")
+                                    w22_t_steps = gr.Slider(2, 8, value=4, step=1, label="Steps (Lightning推奨=4)")
+                                    w22_t_cfg = gr.Slider(1.0, 7.0, value=1.0, step=0.5, label="CFG (Lightning推奨=1.0)")
+                                    w22_t_seed = gr.Number(value=-1, label="Seed (-1=random)", precision=0)
+                                    w22_t_mode = gr.Radio(choices=["normal", "adult"], value="adult", label="Save to")
+
+                            w22_t_btn = gr.Button("🎬 Wan 2.2 T2V 生成", variant="primary", size="lg")
+                            with gr.Row():
+                                w22_t_video = gr.Video(label="Generated Video", height=450)
+                                w22_t_info = gr.Textbox(label="Info", interactive=False, lines=10)
+
+                            w22_t_btn.click(
+                                fn=generate_wan22_t2v,
+                                inputs=[w22_t_prompt, w22_t_neg, w22_t_w, w22_t_h,
+                                        w22_t_duration, w22_t_steps, w22_t_cfg, w22_t_seed, w22_t_mode],
+                                outputs=[w22_t_video, w22_t_info],
+                            )
+
+                        # ── Wan 2.2 I2V ──
+                        with gr.Tab("I2V (画像→動画)"):
+                            gr.Markdown("画像を元に完全無検閲アニメーション生成。元画像を保持しつつ動かす。")
+
+                            with gr.Row():
+                                with gr.Column(scale=2):
+                                    w22_i_image = gr.Image(label="Input Image", type="numpy", height=400)
+                                    w22_i_prompt = gr.Textbox(
+                                        label="Motion Prompt (optional, 英語推奨)",
+                                        lines=3,
+                                        placeholder="例: gentle body movement, breathing, slow push-in camera, intimate atmosphere",
+                                    )
+                                    w22_i_neg = gr.Textbox(
+                                        label="Negative Prompt",
+                                        lines=2,
+                                        value="worst quality, blurry, static, jittery, distorted",
+                                    )
+                                with gr.Column(scale=1):
+                                    w22_i_duration = gr.Slider(
+                                        1, 15, value=5, step=1,
+                                        label="Duration (秒) / 動画の長さ",
+                                    )
+                                    w22_i_w = gr.Slider(512, 1280, value=832, step=16, label="Width")
+                                    w22_i_h = gr.Slider(384, 720, value=480, step=16, label="Height")
+                                    w22_i_steps = gr.Slider(2, 8, value=4, step=1, label="Steps")
+                                    w22_i_cfg = gr.Slider(1.0, 7.0, value=1.0, step=0.5, label="CFG")
+                                    w22_i_seed = gr.Number(value=-1, label="Seed (-1=random)", precision=0)
+                                    w22_i_mode = gr.Radio(choices=["normal", "adult"], value="adult", label="Save to")
+
+                            w22_i_btn = gr.Button("🎬 Wan 2.2 I2V 生成", variant="primary", size="lg")
+                            with gr.Row():
+                                w22_i_video = gr.Video(label="Generated Video", height=450)
+                                w22_i_info = gr.Textbox(label="Info", interactive=False, lines=10)
+
+                            w22_i_btn.click(
+                                fn=generate_wan22_i2v,
+                                inputs=[w22_i_image, w22_i_prompt, w22_i_neg, w22_i_w, w22_i_h,
+                                        w22_i_duration, w22_i_steps, w22_i_cfg, w22_i_seed, w22_i_mode],
+                                outputs=[w22_i_video, w22_i_info],
+                            )
+
+                # ── Sub-tab 6: ControlNet (Pose/Depth/Lineart) ──
+                with gr.Tab("ControlNet (ポーズ指定)"):
+                    gr.Markdown(
+                        "**ControlNet** — ポーズ画像・深度マップ・線画をアップロード → その構図でNSFW画像生成。\n"
+                        "OpenPose棒人間、深度マップ、線画いずれかを使用。"
+                    )
+                    _cn_models = _get_models_for_backend()
+                    _cn_loras = ["None"] + get_available_loras(config["models_dir"])
+
+                    with gr.Row():
+                        cn_image = gr.Image(label="コントロール画像 (ポーズ/深度/線画)", type="numpy", height=400)
+                        cn_result = gr.Gallery(label="結果", columns=1, height=400)
+
+                    with gr.Row():
+                        cn_type = gr.Radio(["openpose", "depth", "lineart"], value="openpose", label="コントロールタイプ")
+                        cn_strength = gr.Slider(0.1, 2.0, value=1.0, step=0.05, label="ControlNet強度")
+
+                    cn_prompt = gr.Textbox(label="プロンプト", lines=3, placeholder="ポーズに合わせたNSFWプロンプト")
+                    cn_negative = gr.Textbox(label="ネガティブ", lines=1, value="worst quality, low quality, deformed")
+
+                    with gr.Accordion("モデル設定", open=False):
+                        cn_model_sel = gr.Dropdown(choices=["(自動)"] + _cn_models, value="(自動)", label="チェックポイント")
+                        with gr.Row():
+                            cn_lora = gr.Dropdown(choices=_cn_loras, value="None", label="LoRA")
+                            cn_lora_str = gr.Slider(0, 2, value=0.8, step=0.05, label="LoRA強度")
+                        with gr.Row():
+                            cn_width = gr.Slider(256, 2048, value=512, step=64, label="Width")
+                            cn_height = gr.Slider(256, 2048, value=768, step=64, label="Height")
+                        with gr.Row():
+                            cn_steps = gr.Slider(1, 100, value=28, step=1, label="Steps")
+                            cn_cfg = gr.Slider(1, 30, value=7, step=0.5, label="CFG")
+                        cn_seed = gr.Number(value=-1, label="Seed", precision=0)
+
+                    cn_gen_btn = gr.Button("Generate with ControlNet", variant="primary", size="lg")
+                    cn_info = gr.Textbox(label="Info", interactive=False)
+
+                    def generate_controlnet_image(image, ctrl_type, strength, prompt_text, neg, model, lora, lora_s, w, h, steps_v, cfg_v, seed_v):
+                        if image is None:
+                            raise gr.Error("コントロール画像をアップロードしてください。")
+                        if not prompt_text.strip():
+                            raise gr.Error("プロンプトを入力してください。")
+                        if not client.is_server_running():
+                            raise gr.Error("ComfyUIが起動していません。")
+
+                        from PIL import Image as PILImage
+                        import numpy as np
+                        img_pil = PILImage.fromarray(image) if isinstance(image, np.ndarray) else image
+                        ts = int(time.time())
+                        img_path = os.path.join(config["output_dir_adult"], f"cn_input_{ts}.png")
+                        img_pil.save(img_path)
+                        img_filename = f"cn_input_{ts}.png"
+                        client.upload_image(img_path, img_filename)
+
+                        models = client.get_models() or _get_models_for_backend()
+                        chosen = model if model and model != "(自動)" else _select_nsfw_model(models)
+                        loras_list = [(lora, float(lora_s))] if lora and lora != "None" else []
+                        s = int(seed_v) if seed_v and seed_v >= 0 else -1
+
+                        workflow = build_controlnet_workflow(
+                            prompt_text, neg, chosen, img_filename, ctrl_type, float(strength),
+                            int(w), int(h), int(steps_v), float(cfg_v), "euler_ancestral", "normal", s, loras=loras_list,
+                        )
+                        result = client.generate(workflow)
+                        if result:
+                            saved = [save_image_to_dir(img, config["output_dir_adult"], prefix="controlnet") for img in result]
+                            return result, f"[ControlNet {ctrl_type}] Model: {chosen}\n保存先: {', '.join(saved)}"
+                        raise gr.Error("ControlNet生成に失敗しました。")
+
+                    cn_gen_btn.click(
+                        fn=generate_controlnet_image,
+                        inputs=[cn_image, cn_type, cn_strength, cn_prompt, cn_negative,
+                                cn_model_sel, cn_lora, cn_lora_str, cn_width, cn_height, cn_steps, cn_cfg, cn_seed],
+                        outputs=[cn_result, cn_info],
+                    )
+
+                # ── Sub-tab 7: IP-Adapter (顔・雰囲気保持) ──
+                with gr.Tab("IP-Adapter (顔保持)"):
+                    gr.Markdown(
+                        "**IP-Adapter** — 参照画像の顔・雰囲気を保持したまま新しい画像を生成。\n"
+                        "同じ人物で異なるポーズ・衣装・シチュエーションを作れます。"
+                    )
+                    _ip_models = _get_models_for_backend()
+                    _ip_loras = ["None"] + get_available_loras(config["models_dir"])
+
+                    with gr.Row():
+                        ip_image = gr.Image(label="参照画像 (この顔/雰囲気を保持)", type="numpy", height=400)
+                        ip_result = gr.Gallery(label="結果", columns=1, height=400)
+
+                    ip_weight = gr.Slider(0.1, 1.5, value=0.8, step=0.05, label="IP-Adapter強度 (高い=参照に忠実)")
+                    ip_prompt = gr.Textbox(label="プロンプト (新しいポーズ・状況)", lines=3,
+                                           placeholder="同じ人物で: different pose, wearing bikini, on the beach")
+                    ip_negative = gr.Textbox(label="ネガティブ", lines=1, value="worst quality, low quality, deformed")
+
+                    with gr.Accordion("モデル設定", open=False):
+                        ip_model_sel = gr.Dropdown(choices=["(自動)"] + _ip_models, value="(自動)", label="チェックポイント")
+                        with gr.Row():
+                            ip_lora = gr.Dropdown(choices=_ip_loras, value="None", label="LoRA")
+                            ip_lora_str = gr.Slider(0, 2, value=0.8, step=0.05, label="LoRA強度")
+                        with gr.Row():
+                            ip_width = gr.Slider(256, 2048, value=512, step=64, label="Width")
+                            ip_height = gr.Slider(256, 2048, value=768, step=64, label="Height")
+                        with gr.Row():
+                            ip_steps = gr.Slider(1, 100, value=28, step=1, label="Steps")
+                            ip_cfg = gr.Slider(1, 30, value=7, step=0.5, label="CFG")
+                        ip_seed = gr.Number(value=-1, label="Seed", precision=0)
+
+                    ip_gen_btn = gr.Button("Generate with IP-Adapter", variant="primary", size="lg")
+                    ip_info = gr.Textbox(label="Info", interactive=False)
+
+                    def generate_ipadapter_image(image, weight, prompt_text, neg, model, lora, lora_s, w, h, steps_v, cfg_v, seed_v):
+                        if image is None:
+                            raise gr.Error("参照画像をアップロードしてください。")
+                        if not prompt_text.strip():
+                            raise gr.Error("プロンプトを入力してください。")
+                        if not client.is_server_running():
+                            raise gr.Error("ComfyUIが起動していません。")
+
+                        from PIL import Image as PILImage
+                        import numpy as np
+                        img_pil = PILImage.fromarray(image) if isinstance(image, np.ndarray) else image
+                        ts = int(time.time())
+                        img_path = os.path.join(config["output_dir_adult"], f"ip_ref_{ts}.png")
+                        img_pil.save(img_path)
+                        img_filename = f"ip_ref_{ts}.png"
+                        client.upload_image(img_path, img_filename)
+
+                        models = client.get_models() or _get_models_for_backend()
+                        chosen = model if model and model != "(自動)" else _select_nsfw_model(models)
+                        loras_list = [(lora, float(lora_s))] if lora and lora != "None" else []
+                        s = int(seed_v) if seed_v and seed_v >= 0 else -1
+
+                        workflow = build_ipadapter_workflow(
+                            prompt_text, neg, chosen, img_filename, float(weight),
+                            int(w), int(h), int(steps_v), float(cfg_v), "euler_ancestral", "normal", s, loras=loras_list,
+                        )
+                        result = client.generate(workflow)
+                        if result:
+                            saved = [save_image_to_dir(img, config["output_dir_adult"], prefix="ipadapter") for img in result]
+                            return result, f"[IP-Adapter] Model: {chosen}, Weight: {weight}\n保存先: {', '.join(saved)}"
+                        raise gr.Error("IP-Adapter生成に失敗しました。")
+
+                    ip_gen_btn.click(
+                        fn=generate_ipadapter_image,
+                        inputs=[ip_image, ip_weight, ip_prompt, ip_negative,
+                                ip_model_sel, ip_lora, ip_lora_str, ip_width, ip_height, ip_steps, ip_cfg, ip_seed],
+                        outputs=[ip_result, ip_info],
+                    )
 
         # ── Video Tab ──
         with gr.Tab("Video"):
-            gr.Markdown("**動画生成** — AnimateDiff で txt2vid / img2vid / vid2vid。SD1.5モデル対応。")
+            _is_cloud = config.get("backend", "local") != "local"
+            gr.Markdown(
+                "**動画生成** — クラウド (fal.ai) またはローカル (AnimateDiff)。\n"
+                "クラウド: 高速・NSFW OK (Kling, Wan, LTX等)。ローカル: SD1.5 + AnimateDiff。"
+                if _is_cloud else
+                "**動画生成** — AnimateDiff で txt2vid / img2vid / vid2vid。SD1.5モデル対応。\n"
+                "クラウド利用はSettingsでbackendをfal等に切り替えてください。"
+            )
 
             # GPU recommendation warning
             video_gpu_warning = gr.Markdown(
                 "**GPU推奨**: 動画生成はRunPod (Cloud GPU) での利用を推奨します。"
-                "ローカルMacでは1本5-15分かかります。"
+                "ローカルMacでは1本30-40分かかります。"
                 if config.get("backend") == "local" else
-                ""
+                "**クラウドモード**: fal.aiで高速動画生成。モデルを選択してください。"
             )
 
-            models = get_available_models(config["models_dir"])
+            models = _get_models_for_backend()
             loras = ["None"] + get_available_loras(config["models_dir"])
             vaes = ["None"] + get_available_vaes(config["models_dir"])
             motion_models = get_available_motion_models()
@@ -1684,7 +4942,18 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
             with gr.Tabs():
                 # ─ txt2vid ─
                 with gr.Tab("Text to Video (txt2vid)"):
-                    gr.Markdown("テキストから動画を生成します。SD1.5のチェックポイントを使用してください。")
+                    gr.Markdown(
+                        "テキストから動画を生成。クラウド時はfal.aiモデルを選択、ローカル時はSD1.5チェックポイント使用。"
+                    )
+
+                    # Cloud model selector (shown when using cloud backend)
+                    v_cloud_model = gr.Dropdown(
+                        choices=list(FAL_VIDEO_MODELS.keys()),
+                        value=list(FAL_VIDEO_MODELS.keys())[0],
+                        label="Cloud動画モデル (fal.ai)",
+                        info="クラウドバックエンド時に使用。Kling=最高品質 / LTX=高速安い / Veo3.1=Google最新",
+                        visible=_is_cloud,
+                    )
 
                     v_quality = gr.Radio(
                         choices=list(VIDEO_PRESETS.keys()),
@@ -1707,8 +4976,15 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
                     with gr.Row():
                         v_w = gr.Slider(256, 1024, value=512, step=64, label="Width")
                         v_h = gr.Slider(256, 1024, value=512, step=64, label="Height")
-                        v_frames = gr.Slider(8, 32, value=16, step=1, label="Frames")
-                        v_fps = gr.Slider(4, 30, value=8, step=1, label="FPS")
+                        v_frames = gr.Slider(8, 32, value=16, step=1, label="Frames (ローカル時)")
+                        v_fps = gr.Slider(4, 30, value=8, step=1, label="FPS (ローカル時)")
+
+                    with gr.Row():
+                        v_duration = gr.Slider(
+                            2, 20, value=5, step=1,
+                            label="🎬 Duration / 動画の長さ (秒)",
+                            info="クラウド時=API送信値 / ローカル時=frames=duration×fps で自動計算",
+                        )
 
                     with gr.Row():
                         v_steps = gr.Slider(1, 50, value=20, step=1, label="Steps")
@@ -1750,13 +5026,24 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
                         fn=generate_video_txt2vid,
                         inputs=[v_prompt, v_neg, v_model, v_motion, v_lora, v_lora_str, v_vae,
                                 v_w, v_h, v_steps, v_cfg, v_sampler, v_sched, v_seed,
-                                v_frames, v_fps, v_format, v_mode],
+                                v_frames, v_fps, v_format, v_mode, v_cloud_model, v_duration],
                         outputs=[v_video, v_preview, v_info],
                     )
 
                 # ─ img2vid ─
                 with gr.Tab("Image to Video (img2vid)"):
-                    gr.Markdown("画像をアニメーションに変換します。元画像の構図を保ちつつ動きを加えます。")
+                    gr.Markdown(
+                        "画像をアニメーションに変換。クラウド時はfal.ai (Kling/Wan/LTX)、ローカル時はAnimateDiff。"
+                    )
+
+                    i2v_cloud_model = gr.Dropdown(
+                        choices=list(FAL_IMG2VID_MODELS.keys()),
+                        value=list(FAL_IMG2VID_MODELS.keys())[0],
+                        label="Cloud img2vidモデル (fal.ai)",
+                        info="Kling=最高品質 / Wan=高品質 / LTX=高速安い",
+                        visible=_is_cloud,
+                    )
+
                     with gr.Row():
                         with gr.Column(scale=2):
                             i2v_image = gr.Image(label="Input Image", type="numpy")
@@ -1771,8 +5058,15 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
                     with gr.Row():
                         i2v_w = gr.Slider(256, 1024, value=512, step=64, label="Width")
                         i2v_h = gr.Slider(256, 1024, value=512, step=64, label="Height")
-                        i2v_frames = gr.Slider(8, 32, value=16, step=1, label="Frames")
-                        i2v_fps = gr.Slider(4, 30, value=8, step=1, label="FPS")
+                        i2v_frames = gr.Slider(8, 32, value=16, step=1, label="Frames (ローカル時)")
+                        i2v_fps = gr.Slider(4, 30, value=8, step=1, label="FPS (ローカル時)")
+
+                    with gr.Row():
+                        i2v_duration = gr.Slider(
+                            2, 20, value=5, step=1,
+                            label="🎬 Duration / 動画の長さ (秒)",
+                            info="クラウド時=API送信値 / ローカル時=frames=duration×fps で自動計算",
+                        )
 
                     with gr.Row():
                         i2v_steps = gr.Slider(1, 50, value=20, step=1, label="Steps")
@@ -1796,9 +5090,141 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
                         fn=generate_video_img2vid,
                         inputs=[i2v_image, i2v_prompt, i2v_neg, i2v_model, i2v_motion, i2v_vae,
                                 i2v_w, i2v_h, i2v_steps, i2v_cfg, i2v_sampler, i2v_sched, i2v_seed,
-                                i2v_frames, i2v_fps, i2v_denoise, i2v_format, i2v_mode],
+                                i2v_frames, i2v_fps, i2v_denoise, i2v_format, i2v_mode, i2v_cloud_model, i2v_duration],
                         outputs=[i2v_video, i2v_preview, i2v_info],
                     )
+
+                # ─ Image to Video PRO (VLM-assisted) ─
+                with gr.Tab("🪄 img2vid Pro (VLM分析)"):
+                    gr.Markdown(
+                        "**画像→動画 Pro** — AIが画像を分析して最適な動きを生成。\n\n"
+                        "- **Preserve (保持)**: 元画像を保ったまま自然にアニメーション化（Canva/Firefly/Kling風）\n"
+                        "- **Inspired (連想)**: 画像の内容を分析して新しい動画を生成（別解釈・スタイル変更OK）\n\n"
+                        "⚠️ 画像分析には OpenAI または Anthropic API Key が必要です（Settingsで設定）"
+                    )
+
+                    with gr.Tabs():
+                        # ── Preserve Mode ──
+                        with gr.Tab("① Preserve (保持してアニメ化)"):
+                            gr.Markdown("画像をそのまま保ちつつ、自然な動きを付ける。Kling/Wan/Veo/Sora/LTX対応。")
+
+                            with gr.Row():
+                                with gr.Column(scale=2):
+                                    pres_image = gr.Image(label="入力画像", type="numpy", height=380)
+                                    pres_prompt = gr.Textbox(
+                                        label="Motion Prompt (空欄OK — AI自動生成)",
+                                        lines=3,
+                                        placeholder="例: soft breeze moving her hair, subtle smile, slow push-in (空欄で自動分析)",
+                                    )
+                                    with gr.Row():
+                                        pres_analyze_btn = gr.Button("🔍 AI画像分析", variant="secondary", size="sm")
+                                        pres_auto_analyze = gr.Checkbox(value=True, label="空欄時に自動分析", scale=0)
+                                with gr.Column(scale=1):
+                                    pres_model = gr.Dropdown(
+                                        choices=list(FAL_IMG2VID_MODELS.keys()),
+                                        value=list(FAL_IMG2VID_MODELS.keys())[0],
+                                        label="img2vid モデル",
+                                        info="Kling=最高品質 / Wan=NSFW OK / Veo/Sora=映画品質 / LTX=高速安い",
+                                    )
+                                    pres_preset = gr.Dropdown(
+                                        choices=list(MOTION_PRESETS.keys()),
+                                        value="(なし)",
+                                        label="Motion Preset (プロンプトに追加)",
+                                        info="微細/ズーム/パン/オービット等",
+                                    )
+                                    pres_duration = gr.Slider(
+                                        2, 20, value=5, step=1,
+                                        label="🎬 Duration (秒) / 動画の長さ",
+                                        info="最大20秒 (Wan2.6/Sora2=15-20s, Kling=10s, Wan2.1/LTX=5s)",
+                                    )
+                                    pres_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="Save to")
+
+                            pres_gen_btn = gr.Button("✨ 保持アニメ化 生成", variant="primary", size="lg")
+
+                            with gr.Row():
+                                pres_video = gr.Video(label="Generated Video", height=400)
+                                pres_info = gr.Textbox(label="Info", interactive=False, lines=8)
+
+                            # Wire events
+                            pres_analyze_btn.click(
+                                fn=img2vid_analyze_motion,
+                                inputs=[pres_image],
+                                outputs=[pres_prompt],
+                            )
+                            pres_gen_btn.click(
+                                fn=generate_img2vid_preserve,
+                                inputs=[pres_image, pres_prompt, pres_preset, pres_model,
+                                        pres_auto_analyze, pres_duration, pres_mode],
+                                outputs=[pres_video, pres_info],
+                            )
+
+                        # ── Inspired Mode ──
+                        with gr.Tab("② Inspired (連想して新規生成)"):
+                            gr.Markdown(
+                                "画像からインスピレーション → AIが内容を分析 → **新しい動画を生成**。\n"
+                                "スタイル変更、別解釈、雰囲気だけ継承、等に使えます。"
+                            )
+
+                            with gr.Row():
+                                with gr.Column(scale=2):
+                                    insp_image = gr.Image(label="参照画像 (分析用)", type="numpy", height=380)
+                                    insp_desc = gr.Textbox(
+                                        label="Scene Description (空欄OK — AI自動生成)",
+                                        lines=6,
+                                        placeholder="例: A woman standing by the window at sunset, warm golden light, cinematic, slow camera push-in...",
+                                    )
+                                    with gr.Row():
+                                        insp_analyze_btn = gr.Button("🔍 AI画像分析", variant="secondary", size="sm")
+                                        insp_style = gr.Dropdown(
+                                            choices=[
+                                                "(なし - そのまま)",
+                                                "cinematic, 8k, film grain, dramatic lighting",
+                                                "anime style, vibrant colors, detailed illustration",
+                                                "dreamy, ethereal, soft focus, pastel colors",
+                                                "photorealistic, 8k, sharp focus, professional photo",
+                                                "oil painting, artistic, brush strokes",
+                                                "cyberpunk, neon, futuristic, sci-fi",
+                                                "watercolor, soft pastels, artistic",
+                                                "noir, black and white, high contrast, dramatic",
+                                            ],
+                                            value="(なし - そのまま)",
+                                            label="Style Hint (追加スタイル)",
+                                        )
+                                with gr.Column(scale=1):
+                                    insp_model = gr.Dropdown(
+                                        choices=list(FAL_VIDEO_MODELS.keys()),
+                                        value=list(FAL_VIDEO_MODELS.keys())[0],
+                                        label="txt2vid モデル",
+                                        info="画像は参照のみ。ここのモデルで新規生成します",
+                                    )
+                                    insp_duration = gr.Slider(
+                                        2, 20, value=5, step=1,
+                                        label="🎬 Duration (秒) / 動画の長さ",
+                                        info="最大20秒 (モデル依存)",
+                                    )
+                                    insp_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="Save to")
+
+                            insp_gen_btn = gr.Button("🎬 連想 新規生成", variant="primary", size="lg")
+
+                            with gr.Row():
+                                insp_video = gr.Video(label="Generated Video", height=400)
+                                insp_info = gr.Textbox(label="Info", interactive=False, lines=8)
+
+                            # Process style hint: filter "(なし)"
+                            def _inspired_wrapper(image, desc, style, model, duration, mode):
+                                style_clean = "" if style.startswith("(なし") else style
+                                return generate_img2vid_inspired(image, desc, style_clean, model, duration, mode)
+
+                            insp_analyze_btn.click(
+                                fn=img2vid_analyze_inspiration,
+                                inputs=[insp_image],
+                                outputs=[insp_desc],
+                            )
+                            insp_gen_btn.click(
+                                fn=_inspired_wrapper,
+                                inputs=[insp_image, insp_desc, insp_style, insp_model, insp_duration, insp_mode],
+                                outputs=[insp_video, insp_info],
+                            )
 
                 # ─ vid2vid ─
                 with gr.Tab("Video to Video (vid2vid)"):
@@ -1976,6 +5402,94 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
 3. 必要に応じて Runway / Pika で特定シーンを拡張
 """)
 
+                # ─ Long Video (自動長尺生成) ─
+                with gr.Tab("Long Video (長尺)"):
+                    gr.Markdown("""
+## 長尺動画生成 — 自動クリップ連結で長い動画を作成
+
+**仕組み:**
+1. 最初のクリップをtxt2vidで生成
+2. 最終フレームを抽出 → img2vidで次のクリップを自動生成
+3. 指定回数繰り返し → ffmpegで自動結合
+
+**例:** 5クリップ x 5秒 = 約25秒の動画
+""")
+                    lv_model = gr.Dropdown(
+                        choices=list(FAL_VIDEO_MODELS.keys()),
+                        value="Wan 2.6 txt2vid (最新・NSFW OK)",
+                        label="動画モデル (最初のクリップ用)",
+                    )
+                    lv_prompt = gr.Textbox(
+                        label="プロンプト (全クリップ共通)",
+                        lines=3,
+                        placeholder="例: A woman walking through a beautiful garden, cinematic, smooth motion, consistent lighting",
+                    )
+                    lv_neg = gr.Textbox(label="Negative Prompt (任意)", lines=1, placeholder="blurry, distorted, low quality")
+                    with gr.Row():
+                        lv_clips = gr.Slider(2, 10, value=3, step=1, label="クリップ数")
+                        lv_duration = gr.Slider(3, 10, value=5, step=1, label="1クリップの秒数")
+                    lv_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先")
+                    lv_btn = gr.Button("長尺動画を生成", variant="primary", size="lg")
+                    lv_video = gr.Video(label="結合動画", height=400)
+                    lv_info = gr.Textbox(label="Info (進捗・コスト)", lines=5, interactive=False)
+
+                    # Estimated cost/time display
+                    lv_estimate = gr.Markdown("")
+                    def estimate_long_video(model_key, clips, dur):
+                        m = FAL_VIDEO_MODELS.get(model_key, {})
+                        cost_str = m.get("cost", "?")
+                        total_sec = int(clips) * int(dur)
+                        return (
+                            f"**見積もり**: {int(clips)}クリップ x {int(dur)}秒 = 約**{total_sec}秒**の動画\n"
+                            f"コスト: {cost_str} x {int(clips)} = (最初のクリップ) + img2vid x {int(clips)-1}"
+                        )
+                    for _inp in [lv_model, lv_clips, lv_duration]:
+                        _inp.change(fn=estimate_long_video, inputs=[lv_model, lv_clips, lv_duration], outputs=[lv_estimate])
+
+                    lv_btn.click(
+                        fn=generate_long_video,
+                        inputs=[lv_prompt, lv_model, lv_clips, lv_duration, lv_neg, lv_mode],
+                        outputs=[lv_video, lv_info],
+                    )
+
+                # ─ Extend Video (動画延長) ─
+                with gr.Tab("Extend Video (延長)"):
+                    gr.Markdown("""
+## 動画延長 — 既存動画の続きを自動生成
+
+**仕組み:**
+1. アップロードした動画の最終フレームを自動抽出
+2. そのフレームからimg2vidで続きを生成
+3. 元動画 + 生成クリップをffmpegで結合
+
+**用途:** 短い動画を長くしたい / 外部ツールで作った動画を延長したい
+""")
+                    ev_video_in = gr.Video(label="元動画（延長したい動画）")
+                    ev_prompt = gr.Textbox(
+                        label="延長部分のプロンプト（任意）",
+                        lines=2,
+                        placeholder="例: continue walking, smooth motion (空欄の場合は自動で 'smooth continuation' を使用)",
+                    )
+                    ev_model = gr.Dropdown(
+                        choices=list(FAL_VIDEO_MODELS.keys()),
+                        value="Wan 2.6 txt2vid (最新・NSFW OK)",
+                        label="モデル (img2vidが自動選択される)",
+                    )
+                    with gr.Row():
+                        ev_extensions = gr.Slider(1, 10, value=2, step=1, label="追加クリップ数")
+                        ev_duration = gr.Slider(3, 10, value=5, step=1, label="1クリップの秒数")
+                    ev_neg = gr.Textbox(label="Negative Prompt (任意)", lines=1)
+                    ev_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先")
+                    ev_btn = gr.Button("動画を延長", variant="primary", size="lg")
+                    ev_video_out = gr.Video(label="延長済み動画", height=400)
+                    ev_info = gr.Textbox(label="Info", lines=4, interactive=False)
+
+                    ev_btn.click(
+                        fn=generate_extend_video,
+                        inputs=[ev_video_in, ev_prompt, ev_model, ev_extensions, ev_duration, ev_neg, ev_mode],
+                        outputs=[ev_video_out, ev_info],
+                    )
+
         # ── Flux / Cloud AI Tab ──
         with gr.Tab("Flux / Cloud AI"):
             gr.Markdown(
@@ -2131,10 +5645,12 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
 **fal.ai料金の目安 (1枚あたり):**
 | モデル | 品質 | 速度 | 料金 | NSFW |
 |--------|------|------|------|------|
-| Flux Pro 1.1 | 最高 | 普通 | ~$0.05 (~¥8) | OK |
-| Flux Dev | 高い | 普通 | ~$0.025 (~¥4) | OK |
-| Flux Schnell | 良い | 最速 | ~$0.003 (~¥0.5) | OK |
-| Flux Realism | 最高(写真) | 普通 | ~$0.025 (~¥4) | OK |
+| Flux Dev | 高い | 普通 | ~$0.025 (~¥4) | **完全OK** |
+| Flux Schnell | 良い | 最速 | ~$0.003 (~¥0.5) | **完全OK** |
+| Flux Realism | 最高(写真) | 普通 | ~$0.025 (~¥4) | **完全OK** |
+| Flux Pro 1.1 | 最高 | 普通 | ~$0.05 (~¥8) | ❌ SFWのみ |
+
+⚠️ **Flux Pro 1.1はNSFWで真っ黒になります。NSFW→ Dev / Realism / Schnell を使ってください。**
 """)
 
                 # ── AI動画生成 (Replicate) ──
@@ -2175,27 +5691,89 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
 
                 # ── fal.ai 動画生成 ──
                 with gr.Tab("AI動画 (fal.ai)"):
-                    gr.Markdown("**fal.ai動画生成** — Kling, Wan, Minimax等の動画モデル。NSFW OK。")
+                    gr.Markdown(
+                        "**fal.ai動画生成** — Veo 3, Sora 2, Kling, Wan等の動画モデル。\n\n"
+                        "**長さ**: モデルにより最大5-20秒。長い動画は「長尺動画」タブで自動連結。"
+                    )
                     fv_model = gr.Dropdown(
                         choices=list(FAL_VIDEO_MODELS.keys()),
                         value=list(FAL_VIDEO_MODELS.keys())[0],
                         label="動画モデル",
                     )
                     fv_prompt = gr.Textbox(label="Prompt", lines=3, placeholder="例: A woman walking on the beach at sunset, cinematic, slow motion")
+                    fv_neg = gr.Textbox(label="Negative Prompt (任意)", lines=1, placeholder="blurry, low quality, distorted")
+                    with gr.Row():
+                        fv_duration = gr.Slider(1, 20, value=5, step=1, label="秒数 (モデルの最大値で自動クランプ)")
+                        fv_seed = gr.Number(value=-1, label="Seed (-1=random)")
+                    with gr.Row():
+                        fv_width = gr.Slider(256, 1920, value=1280, step=64, label="Width (対応モデルのみ)")
+                        fv_height = gr.Slider(256, 1080, value=720, step=64, label="Height (対応モデルのみ)")
                     fv_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先")
                     fv_gen_btn = gr.Button("動画生成 (fal.ai)", variant="primary", size="lg")
                     fv_video = gr.Video(label="Generated Video", height=400)
                     fv_info = gr.Textbox(label="Info", interactive=False)
 
+                    # Show model info on selection
+                    fv_model_info = gr.Markdown("")
+                    def show_video_model_info(key):
+                        m = FAL_VIDEO_MODELS.get(key, {})
+                        nsfw = "NSFW OK" if m.get("nsfw") else "SFWのみ"
+                        return (
+                            f"**最大秒数**: {m.get('max_duration', '?')}秒 | "
+                            f"**解像度変更**: {'対応' if m.get('supports_resolution') else '固定'} | "
+                            f"**{nsfw}** | コスト: {m.get('cost', '?')}"
+                        )
+                    fv_model.change(fn=show_video_model_info, inputs=[fv_model], outputs=[fv_model_info])
+
                     fv_gen_btn.click(
                         fn=generate_fal_video,
-                        inputs=[fv_prompt, fv_model, fv_mode],
+                        inputs=[fv_prompt, fv_model, fv_mode, fv_duration, fv_width, fv_height, fv_neg, fv_seed],
                         outputs=[fv_video, fv_info],
                     )
 
+                # ── img2vid (画像→動画) ──
+                with gr.Tab("画像→動画 (img2vid)"):
+                    gr.Markdown(
+                        "**画像→動画変換** — Face Swap画像や生成画像を動画化。fal.aiクラウド処理。\n\n"
+                        "**使い方:** Face Swapタブで作った画像をここにドラッグ → 動画化"
+                    )
+                    iv_model = gr.Dropdown(
+                        choices=list(FAL_IMG2VID_MODELS.keys()),
+                        value=list(FAL_IMG2VID_MODELS.keys())[0],
+                        label="動画モデル",
+                        info="Veo3/Sora2=最高品質 / Kling=高品質 / Wan=NSFW OK / LTX=高速安い",
+                    )
+                    iv_image = gr.Image(label="入力画像（Face Swap結果やAI生成画像）", type="filepath")
+                    iv_prompt = gr.Textbox(
+                        label="動きの指示（任意）",
+                        lines=2,
+                        placeholder="例: gentle smile, hair blowing in wind, slow camera zoom in",
+                    )
+                    iv_duration = gr.Slider(1, 20, value=5, step=1, label="秒数 (モデルの最大値で自動クランプ)")
+                    with gr.Row():
+                        iv_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先", scale=1)
+                        iv_btn = gr.Button("画像→動画 生成", variant="primary", size="lg", scale=2)
+                    iv_video = gr.Video(label="Generated Video", height=400)
+                    iv_info = gr.Textbox(label="Info", interactive=False)
+
+                    iv_btn.click(
+                        fn=generate_fal_img2vid,
+                        inputs=[iv_image, iv_prompt, iv_model, iv_mode, iv_duration],
+                        outputs=[iv_video, iv_info],
+                    )
+
+                    gr.Markdown("""
+**img2vid料金の目安:**
+| モデル | 品質 | 料金 |
+|--------|------|------|
+| Kling 2.5 Turbo Pro | 最高 | ~$0.10 (~¥15) |
+| Wan 2.1 | 高い | ~$0.05 (~¥8) |
+| LTX 2.3 | 良い(高速) | ~$0.02 (~¥3) |
+""")
+
                 # ── Dezgo 動画生成 ──
                 with gr.Tab("AI動画 (Dezgo)"):
-                    gr.Markdown("**Dezgo動画生成** — 完全無検閲。Wan 2.2モデル。")
+                    gr.Markdown("**Dezgo動画生成** — 完全無検閲。Wan 2.6モデル。")
                     dv_model = gr.Dropdown(
                         choices=list(DEZGO_VIDEO_MODELS.keys()),
                         value=list(DEZGO_VIDEO_MODELS.keys())[0],
@@ -2263,11 +5841,13 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
                         cg_prompt = gr.Textbox(label="Prompt", lines=3, placeholder="masterpiece, best quality, RAW photo, beautiful woman...")
                         cg_negative = gr.Textbox(label="Negative Prompt", lines=2, value="worst quality, low quality, blurry, deformed, ugly, bad anatomy")
                     with gr.Column(scale=1):
+                        _cg_icloud = get_icloud_only_models()
+                        _cg_icloud_prefixed = [f"[iCloud] {m}" for m in _cg_icloud]
                         cg_model = gr.Dropdown(
-                            choices=list(CIVITAI_GENERATION_MODELS.keys()),
+                            choices=list(CIVITAI_GENERATION_MODELS.keys()) + _cg_icloud_prefixed,
                             value="Juggernaut XL Ragnarok (SDXL 最高品質)",
-                            label="Model (プリセット)",
-                            info="SDXL系が高品質。NSFW→Pony系推奨。Version IDでも可",
+                            label="Model (プリセット / iCloud)",
+                            info="SDXL系が高品質。NSFW→Pony系推奨。[iCloud]はCivitAIでURN自動解決",
                         )
                         cg_version_id = gr.Textbox(
                             label="Version ID (検索結果から・空欄ならプリセット使用)",
@@ -2364,6 +5944,52 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
                 c_open_models_btn.click(fn=lambda: open_folder(config["models_dir"]), outputs=[c_url_dl_status])
 
             with gr.Group():
+                gr.Markdown("### Vault (クラウドモデル保管庫)")
+                gr.Markdown(
+                    "CivitAI Vaultに保存したモデルの一覧表示・ダウンロード。\n"
+                    "Supporter以上のプランで利用可能。ダウンロード先はGoogle Driveに自動保存されます。"
+                )
+                with gr.Row():
+                    vault_query = gr.Textbox(label="検索 (空欄=全件)", placeholder="モデル名で検索", scale=2)
+                    vault_list_btn = gr.Button("Vault一覧を取得", variant="primary", scale=1)
+                vault_results = gr.Textbox(label="Vaultアイテム一覧", lines=12, interactive=False)
+                with gr.Row():
+                    vault_version_id = gr.Textbox(label="Version ID (一覧からコピペ)", placeholder="ダウンロードしたいモデルのVersion ID", scale=2)
+                    vault_dest_type = gr.Dropdown(
+                        choices=["Checkpoint", "LoRA", "VAE", "ControlNet", "Upscaler", "Embedding"],
+                        value="Checkpoint", label="保存先タイプ", scale=1,
+                    )
+                    vault_dl_btn = gr.Button("Vaultからダウンロード", variant="primary", scale=1)
+                vault_status = gr.Textbox(label="Vault状況", lines=3, interactive=False)
+
+                def list_vault_items(query):
+                    try:
+                        info = civitai.vault_get()
+                        storage_used = info.get("usedStorageKb", 0) / 1024 / 1024
+                        storage_limit = info.get("storageKb", 0) / 1024 / 1024
+                        header = f"Vault: {storage_used:.1f}GB / {storage_limit:.1f}GB 使用中\n{'='*50}\n"
+
+                        items_data = civitai.vault_list(limit=60, query=query or "")
+                        items = items_data.get("items", []) if isinstance(items_data, dict) else []
+                        if not items:
+                            return header + "Vaultにアイテムがありません。"
+                        lines = [header]
+                        for i, item in enumerate(items, 1):
+                            name = item.get("modelName", "Unknown")
+                            version = item.get("versionName", "")
+                            vid = item.get("modelVersionId", "?")
+                            model_type = item.get("type", "")
+                            files = item.get("files", [])
+                            size = sum(f.get("sizeKB", 0) for f in files) / 1024 / 1024 if files else 0
+                            lines.append(f"[{i}] {name} ({version})\n    Type: {model_type} | Size: {size:.1f}GB | Version ID: {vid}")
+                        return "\n".join(lines)
+                    except Exception as e:
+                        return f"Vaultエラー: {e}\n\nAPI Keyが正しく設定されているか確認してください。\nVaultはSupporter以上のプランで利用可能です。"
+
+                vault_list_btn.click(fn=list_vault_items, inputs=[vault_query], outputs=[vault_results])
+                # vault_dl_btn event wired below after _all_model_outputs is defined
+
+            with gr.Group():
                 gr.Markdown("### Upload (画像アップロード)")
                 gr.Markdown("生成した画像をCivitAIに投稿します。(API Key必須)")
                 with gr.Row():
@@ -2412,6 +6038,380 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
                 inputs=[c_url, c_url_type, c_url_filename],
                 outputs=_url_model_outputs,
             )
+            # Vault download button (defined above, wired here after _all_model_outputs)
+            _vault_model_outputs = [
+                vault_status, q_model, q_lora, q_vae, a_model, a_lora, a_vae,
+                v_model, v_lora, v_vae, v_motion,
+                i2v_model, i2v_vae, i2v_motion,
+                v2v_model, v2v_vae, v2v_motion,
+                c_model_summary,
+            ]
+            vault_dl_btn.click(
+                fn=civitai_download,
+                inputs=[vault_version_id, vault_dest_type],
+                outputs=_vault_model_outputs,
+            )
+
+            # ── vast.ai ComfyUI Direct Install ──
+            gr.Markdown("---")
+            gr.Markdown("### vast.ai ComfyUI にモデルをインストール")
+            gr.Markdown(
+                "CivitAI Early Access等、Novita.aiに未掲載のモデルを\n"
+                "vast.ai ComfyUIインスタンスに直接ダウンロード。\n"
+                "NSFW生成にCivitAIモデルを使いたい場合に。"
+            )
+            with gr.Row():
+                vast_dl_input = gr.Textbox(
+                    label="CivitAI Version ID または ダウンロードURL",
+                    placeholder="例: 1234567 or https://civitai.com/api/download/models/1234567",
+                    scale=2,
+                )
+                vast_dl_type = gr.Dropdown(
+                    choices=["Checkpoint", "LoRA", "VAE", "Embedding", "ControlNet"],
+                    value="LoRA", label="モデルタイプ", scale=1,
+                )
+                vast_dl_btn = gr.Button("vast.aiにインストール", variant="primary", scale=1)
+            vast_dl_status = gr.Textbox(label="インストール状況", lines=3, interactive=False)
+
+            vast_dl_btn.click(
+                fn=install_to_vastai,
+                inputs=[vast_dl_input, vast_dl_type],
+                outputs=[vast_dl_status],
+            )
+
+        # ══════════════════════════════════════════════
+        # NEW ADVANCED TABS (ai-studio parity)
+        # ══════════════════════════════════════════════
+
+        # ── Style Transfer Tab ──
+        with gr.Tab("Style Transfer"):
+            gr.Markdown(
+                "**Style Transfer** — 画像にアートスタイルを適用。fal.aiクラウド処理\n\n"
+                "1. 元画像をアップロード → 2. スタイル選択 → 3. 「スタイル適用」"
+            )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    st_image = gr.Image(label="元画像", type="filepath")
+                with gr.Column(scale=1):
+                    st_style = gr.Dropdown(
+                        choices=list(STYLE_PRESETS.keys()),
+                        value=list(STYLE_PRESETS.keys())[0],
+                        label="スタイル",
+                    )
+                    st_strength = gr.Slider(0.3, 1.0, value=0.75, step=0.05, label="強度 (高い=スタイル強め)")
+                    st_custom = gr.Textbox(label="追加プロンプト (任意)", placeholder="描写の補足...", lines=2)
+                    st_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先")
+                    st_btn = gr.Button("スタイル適用", variant="primary", size="lg")
+            st_result = gr.Image(label="結果", height=512)
+            st_info = gr.Textbox(label="Info", interactive=False)
+
+            st_btn.click(
+                fn=generate_style_transfer,
+                inputs=[st_image, st_style, st_custom, st_strength, st_mode],
+                outputs=[st_result, st_info],
+            )
+
+        # ── Inpaint Tab ──
+        with gr.Tab("Inpaint"):
+            gr.Markdown(
+                "**Inpaint** — 画像の一部をマスクで指定して再生成\n\n"
+                "1. 元画像 + マスク画像（白=編集エリア）をアップロード\n"
+                "2. 編集内容をプロンプトで記述 → 「インペイント実行」"
+            )
+            with gr.Row():
+                ip_image = gr.Image(label="元画像", type="filepath")
+                ip_mask = gr.Image(label="マスク（白=編集エリア）", type="filepath")
+            ip_prompt = gr.Textbox(label="プロンプト (編集内容)", placeholder="例: blue eyes, smiling face", lines=2)
+            ip_neg = gr.Textbox(label="Negative Prompt", value="worst quality, blurry, deformed", lines=1)
+            with gr.Row():
+                ip_w = gr.Slider(256, 2048, value=1024, step=64, label="Width")
+                ip_h = gr.Slider(256, 2048, value=1024, step=64, label="Height")
+            with gr.Row():
+                ip_steps = gr.Slider(1, 50, value=28, step=1, label="Steps")
+                ip_guidance = gr.Slider(1.0, 10.0, value=3.5, step=0.5, label="Guidance")
+                ip_seed = gr.Number(value=-1, label="Seed (-1=random)")
+            ip_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先")
+            ip_btn = gr.Button("インペイント実行", variant="primary", size="lg")
+            ip_result = gr.Image(label="結果", height=512)
+            ip_info = gr.Textbox(label="Info", interactive=False)
+
+            ip_btn.click(
+                fn=generate_inpaint,
+                inputs=[ip_image, ip_mask, ip_prompt, ip_neg, ip_w, ip_h, ip_steps, ip_guidance, ip_seed, ip_mode],
+                outputs=[ip_result, ip_info],
+            )
+
+        # ── Remove BG Tab ──
+        with gr.Tab("Remove BG"):
+            gr.Markdown(
+                "**Background Removal** — AIで背景を自動除去（透明PNG出力）\n\n"
+                "画像をアップロードして「背景除去」を押すだけ。"
+            )
+            with gr.Row():
+                rmbg_image = gr.Image(label="入力画像", type="filepath")
+                rmbg_result = gr.Image(label="結果（透明背景）", height=512)
+            rmbg_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先")
+            rmbg_btn = gr.Button("背景除去", variant="primary", size="lg")
+            rmbg_info = gr.Textbox(label="Info", interactive=False)
+
+            rmbg_btn.click(
+                fn=generate_remove_bg,
+                inputs=[rmbg_image, rmbg_mode],
+                outputs=[rmbg_result, rmbg_info],
+            )
+
+        # ── Upscale Tab ──
+        with gr.Tab("Upscale"):
+            gr.Markdown(
+                "**AI Upscale** — AIによる高品質アップスケーリング\n\n"
+                "画像をアップロード → 倍率選択 → 「アップスケール実行」\n"
+                "2x=Aura SR (高速)、4x=Clarity Upscaler (高品質)"
+            )
+            with gr.Row():
+                us_image = gr.Image(label="入力画像", type="filepath")
+                us_result = gr.Image(label="結果", height=512)
+            with gr.Row():
+                us_scale = gr.Radio(choices=["2", "4"], value="2", label="倍率")
+                us_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先")
+            us_btn = gr.Button("アップスケール実行", variant="primary", size="lg")
+            us_info = gr.Textbox(label="Info", interactive=False)
+
+            us_btn.click(
+                fn=generate_upscale,
+                inputs=[us_image, us_scale, us_mode],
+                outputs=[us_result, us_info],
+            )
+
+        # ── ControlNet Cloud Tab ──
+        with gr.Tab("ControlNet"):
+            gr.Markdown(
+                "**ControlNet (Cloud)** — 参照画像の構図・ポーズ・輪郭を維持して新しい画像を生成\n\n"
+                "1. コントロール画像（エッジ/深度/ポーズ/スケッチ）をアップロード\n"
+                "2. コントロールタイプ選択 + プロンプト → 「生成」"
+            )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    cn_image = gr.Image(label="コントロール画像", type="filepath")
+                with gr.Column(scale=1):
+                    cn_type = gr.Dropdown(
+                        choices=list(CONTROLNET_TYPES.keys()),
+                        value=list(CONTROLNET_TYPES.keys())[0],
+                        label="コントロールタイプ",
+                    )
+                    cn_strength = gr.Slider(0.1, 2.0, value=0.7, step=0.1, label="コントロール強度")
+            cn_prompt = gr.Textbox(label="プロンプト", placeholder="例: beautiful anime girl, detailed...", lines=2)
+            cn_neg = gr.Textbox(label="Negative Prompt", value="worst quality, blurry, deformed", lines=1)
+            with gr.Row():
+                cn_w = gr.Slider(256, 2048, value=1024, step=64, label="Width")
+                cn_h = gr.Slider(256, 2048, value=1024, step=64, label="Height")
+            with gr.Row():
+                cn_steps = gr.Slider(1, 50, value=28, step=1, label="Steps")
+                cn_guidance = gr.Slider(1.0, 10.0, value=3.5, step=0.5, label="Guidance")
+                cn_seed = gr.Number(value=-1, label="Seed")
+            cn_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先")
+            cn_btn = gr.Button("ControlNet生成", variant="primary", size="lg")
+            cn_result = gr.Image(label="結果", height=512)
+            cn_info = gr.Textbox(label="Info", interactive=False)
+
+            cn_btn.click(
+                fn=generate_controlnet,
+                inputs=[cn_image, cn_prompt, cn_neg, cn_type, cn_strength, cn_w, cn_h, cn_steps, cn_guidance, cn_seed, cn_mode],
+                outputs=[cn_result, cn_info],
+            )
+
+        # ── Vid2Vid Cloud Tab ──
+        with gr.Tab("Vid2Vid Cloud"):
+            gr.Markdown(
+                "**Video-to-Video (Cloud)** — 動画のスタイル変換・リメイク\n\n"
+                "元動画をアップロード → プロンプトでスタイル指定 → クラウドで変換\n"
+                "モーションを維持しながらスタイルを変更できます。"
+            )
+            v2v_video = gr.Video(label="元動画")
+            v2v_prompt = gr.Textbox(label="プロンプト (変換後のスタイル)", placeholder="例: anime style, studio ghibli, colorful...", lines=2)
+            with gr.Row():
+                v2v_model = gr.Dropdown(
+                    choices=list(FAL_VID2VID_MODELS.keys()),
+                    value=list(FAL_VID2VID_MODELS.keys())[0],
+                    label="モデル",
+                    scale=2,
+                )
+                v2v_strength = gr.Slider(0.2, 0.9, value=0.6, step=0.05, label="変換強度 (高い=大きく変化)")
+            v2v_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先")
+            v2v_btn = gr.Button("Vid2Vid 実行", variant="primary", size="lg")
+            v2v_result = gr.Video(label="結果")
+            v2v_info = gr.Textbox(label="Info", interactive=False)
+
+            v2v_btn.click(
+                fn=generate_vid2vid_cloud,
+                inputs=[v2v_video, v2v_prompt, v2v_model, v2v_strength, v2v_mode],
+                outputs=[v2v_result, v2v_info],
+            )
+
+        # ── Art Presets Tab ──
+        with gr.Tab("Art Presets"):
+            gr.Markdown(
+                "**芸術プリセット** — ワンクリックで芸術性の高い画像を生成\n\n"
+                "プロンプト + プリセット選択 → 最適なモデル・設定で自動生成\n"
+                "NSFWプリセットも含みます。"
+            )
+            with gr.Tabs():
+                with gr.Tab("芸術プリセット"):
+                    ap_prompt = gr.Textbox(label="プロンプト (被写体・シーン)", placeholder="例: a woman standing in autumn forest", lines=3)
+                    ap_preset = gr.Dropdown(
+                        choices=list(ART_PRESETS.keys()),
+                        value=list(ART_PRESETS.keys())[0],
+                        label="プリセット",
+                    )
+                    with gr.Row():
+                        ap_seed = gr.Number(value=-1, label="Seed (-1=random)")
+                        ap_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先")
+                    ap_btn = gr.Button("生成", variant="primary", size="lg")
+                    ap_gallery = gr.Gallery(label="結果", columns=2, height=512)
+                    ap_info = gr.Textbox(label="Info", interactive=False)
+
+                    # Show preset details
+                    ap_details = gr.Markdown("")
+                    def show_preset_details(key):
+                        p = ART_PRESETS.get(key, {})
+                        return (
+                            f"**Model**: {p.get('model', '?')}\n"
+                            f"**Size**: {p.get('width', '?')}x{p.get('height', '?')}\n"
+                            f"**Steps**: {p.get('steps', '?')} | **CFG**: {p.get('cfg', '?')}\n"
+                            f"**Suffix**: {p.get('prompt_suffix', '')[:100]}..."
+                        )
+                    ap_preset.change(fn=show_preset_details, inputs=[ap_preset], outputs=[ap_details])
+
+                    ap_btn.click(
+                        fn=generate_with_art_preset,
+                        inputs=[ap_prompt, ap_preset, ap_seed, ap_mode],
+                        outputs=[ap_gallery, ap_info],
+                    )
+
+                with gr.Tab("NSFW 画像"):
+                    gr.Markdown(
+                        "**NSFW画像生成** — AV品質 / グラビア / アニメ / フェティッシュ\n\n"
+                        "fal.ai → Dezgo → Novita の自動フォールバックでブロックされません。\n"
+                        "自動アップスケールで超高画質出力も可能。"
+                    )
+                    nsfw_preset_sel = gr.Dropdown(
+                        choices=list(NSFW_PRESETS.keys()),
+                        value=list(NSFW_PRESETS.keys())[0],
+                        label="NSFWプリセット",
+                    )
+                    nsfw_prompt_input = gr.Textbox(
+                        label="追加プロンプト (被写体・ポーズ・シーン)",
+                        placeholder="例: beautiful japanese woman, lying on bed, looking at camera, seductive smile",
+                        lines=3,
+                    )
+                    with gr.Row():
+                        nsfw_seed_input = gr.Number(value=-1, label="Seed (-1=random)")
+                        nsfw_upscale_check = gr.Checkbox(value=False, label="自動2xアップスケール (超高画質)")
+                    nsfw_gen_btn = gr.Button("NSFW画像を生成 (自動フォールバック)", variant="primary", size="lg")
+                    nsfw_gallery_out = gr.Gallery(label="結果", columns=2, height=512)
+                    nsfw_info_out = gr.Textbox(label="Info", lines=3, interactive=False)
+
+                    # Preset details
+                    nsfw_detail_md = gr.Markdown("")
+                    def show_nsfw_detail(key):
+                        p = NSFW_PRESETS.get(key, {})
+                        fb = p.get("fallback_provider", "dezgo")
+                        return (
+                            f"**推奨モデル**: {', '.join(p.get('recommended_models', []))}\n"
+                            f"**推奨LoRA** (ローカル): {', '.join(p.get('recommended_loras', []))}\n"
+                            f"**サイズ**: {p.get('settings', {}).get('width', '?')}x{p.get('settings', {}).get('height', '?')} | "
+                            f"Steps: {p.get('settings', {}).get('steps', '?')} | "
+                            f"フォールバック: {fb}\n"
+                            f"**Base prompt**: {p.get('prompt_base', '')[:120]}..."
+                        )
+                    nsfw_preset_sel.change(fn=show_nsfw_detail, inputs=[nsfw_preset_sel], outputs=[nsfw_detail_md])
+
+                    nsfw_gen_btn.click(
+                        fn=generate_nsfw_with_fallback,
+                        inputs=[nsfw_prompt_input, nsfw_preset_sel, nsfw_seed_input, nsfw_upscale_check],
+                        outputs=[nsfw_gallery_out, nsfw_info_out],
+                    )
+
+                with gr.Tab("NSFW 動画"):
+                    gr.Markdown(
+                        "**NSFW動画生成** — Wan (NSFW OK) で無検閲動画を生成\n\n"
+                        "txt2vid (プロンプトから) または img2vid (画像から動画化) が選べます。"
+                    )
+                    nv_preset = gr.Dropdown(
+                        choices=list(NSFW_VIDEO_PRESETS.keys()),
+                        value=list(NSFW_VIDEO_PRESETS.keys())[0],
+                        label="動画プリセット",
+                    )
+                    nv_prompt = gr.Textbox(
+                        label="追加プロンプト (動きや詳細を記述)",
+                        placeholder="例: slowly removing clothes, looking at camera, soft smile",
+                        lines=3,
+                    )
+                    nv_image = gr.Image(label="入力画像 (img2vid の場合 - 任意)", type="filepath")
+                    nv_btn = gr.Button("NSFW動画を生成", variant="primary", size="lg")
+                    nv_video = gr.Video(label="結果", height=400)
+                    nv_info = gr.Textbox(label="Info", interactive=False)
+
+                    nv_btn.click(
+                        fn=generate_nsfw_video_preset,
+                        inputs=[nv_prompt, nv_preset, nv_image],
+                        outputs=[nv_video, nv_info],
+                    )
+
+                with gr.Tab("HQ 高品質生成"):
+                    gr.Markdown(
+                        "**最高品質画像生成** — 最大パラメータ + 自動アップスケールで超高画質\n\n"
+                        "生成後に自動で2xアップスケールを適用し、最大2432x2432の画像を出力。"
+                    )
+                    hq_prompt = gr.Textbox(label="プロンプト", lines=3, placeholder="詳細なプロンプトほど高品質")
+                    hq_neg = gr.Textbox(label="Negative Prompt", value="ugly, deformed, blurry, low quality, worst quality, bad anatomy, extra fingers, watermark, text, logo, jpeg artifacts", lines=2)
+                    hq_model = gr.Dropdown(
+                        choices=list(FAL_MODELS.keys()),
+                        value="Flux Realism (フォトリアル・NSFW OK)",
+                        label="モデル",
+                    )
+                    with gr.Row():
+                        hq_w = gr.Slider(512, 2048, value=1216, step=64, label="Width")
+                        hq_h = gr.Slider(512, 2048, value=1216, step=64, label="Height")
+                    with gr.Row():
+                        hq_steps = gr.Slider(20, 50, value=40, step=1, label="Steps (高い=高品質)")
+                        hq_guidance = gr.Slider(1.0, 10.0, value=4.0, step=0.5, label="Guidance")
+                    with gr.Row():
+                        hq_seed = gr.Number(value=-1, label="Seed")
+                        hq_batch = gr.Slider(1, 4, value=1, step=1, label="枚数")
+                    hq_upscale = gr.Checkbox(value=True, label="自動2xアップスケール (生成後にAI拡大)")
+                    hq_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先")
+                    hq_btn = gr.Button("最高品質で生成", variant="primary", size="lg")
+                    hq_gallery = gr.Gallery(label="結果", columns=2, height=512)
+                    hq_info = gr.Textbox(label="Info", lines=3, interactive=False)
+
+                    hq_btn.click(
+                        fn=generate_hq_image,
+                        inputs=[hq_prompt, hq_neg, hq_model, hq_w, hq_h, hq_steps, hq_guidance, hq_seed, hq_batch, hq_upscale, hq_mode],
+                        outputs=[hq_gallery, hq_info],
+                    )
+
+        # ── Face Swap Tab ──
+        with gr.Tab("Face Swap"):
+            gr.Markdown(
+                "**Face Swap** — 顔の入れ替え。fal.aiクラウド処理（Mac負荷ゼロ）\n\n"
+                "1. ベース画像（体・シーン）をアップロード\n"
+                "2. 顔画像（入れ替えたい顔）をアップロード\n"
+                "3. 「Face Swap 実行」を押す"
+            )
+            with gr.Row():
+                fs_base = gr.Image(label="ベース画像（体・シーン）", type="filepath")
+                fs_face = gr.Image(label="顔画像（入れ替える顔）", type="filepath")
+            with gr.Row():
+                fs_mode = gr.Radio(choices=["normal", "adult"], value="normal", label="保存先", scale=1)
+                fs_btn = gr.Button("Face Swap 実行", variant="primary", size="lg", scale=2)
+            fs_result = gr.Image(label="結果", height=512)
+            fs_info = gr.Textbox(label="Info", interactive=False)
+
+            fs_btn.click(
+                fn=generate_face_swap,
+                inputs=[fs_base, fs_face, fs_mode],
+                outputs=[fs_result, fs_info],
+            )
 
         # ── AI Assistant Tab ──
         with gr.Tab("AI Assistant"):
@@ -2425,7 +6425,7 @@ with gr.Blocks(title="AI-diffusion Studio") as app:
                     scale=2,
                 )
                 ai_model_override = gr.Dropdown(
-                    choices=["auto", "claude-opus-4-20250514", "claude-sonnet-4-20250514", "claude-haiku-4-5-20251001", "gpt-4o", "gpt-4o-mini", "grok-3", "grok-3-mini"],
+                    choices=["auto", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "gpt-4.1", "gpt-4.1-mini", "grok-3", "grok-3-mini"],
                     value="auto",
                     label="モデル (auto=プロバイダーのデフォルト)",
                     scale=2,
@@ -2670,7 +6670,7 @@ SETTINGS: Model=xxx | Steps=xx | CFG=x.x | Size=WxH | Sampler=xxx | Scheduler=xx
                         gr.Markdown(section["content"])
 
                 with gr.Tab("プロンプトテンプレート"):
-                    gr.Markdown("## プロンプトテンプレート\nコピペしてQuick/Adultタブで使えます。")
+                    gr.Markdown("## プロンプトテンプレート\n「適用」ボタンでQuick/Adultタブに直接反映されます。")
                     for key, tmpl in PROMPT_TEMPLATES.items():
                         with gr.Group():
                             gr.Markdown(f"### {tmpl['name']}")
@@ -2679,6 +6679,160 @@ SETTINGS: Model=xxx | Steps=xx | CFG=x.x | Size=WxH | Sampler=xxx | Scheduler=xx
                             settings_str = f"Steps: {tmpl['settings']['steps']} | CFG: {tmpl['settings']['cfg']} | Size: {tmpl['settings']['width']}x{tmpl['settings']['height']} | Sampler: {tmpl['settings']['sampler']}"
                             gr.Markdown(f"**設定**: {settings_str}")
                             gr.Markdown(f"**推奨モデル**: {', '.join(tmpl['recommended_models'])}")
+                            with gr.Row():
+                                _apply_q = gr.Button("→ Quickに適用", size="sm")
+                                _apply_a = gr.Button("→ Adultに適用", size="sm")
+                            _apply_q.click(
+                                fn=lambda t=tmpl: (
+                                    gr.update(value=t["prompt"]),
+                                    gr.update(value=t["negative"]),
+                                    gr.update(value=t["settings"]["steps"]),
+                                    gr.update(value=t["settings"]["cfg"]),
+                                    gr.update(value=t["settings"]["sampler"]),
+                                    gr.update(value=t["settings"]["width"]),
+                                    gr.update(value=t["settings"]["height"]),
+                                ),
+                                inputs=[],
+                                outputs=[q_prompt, q_neg, q_steps, q_cfg, q_sampler, q_w, q_h],
+                            )
+                            _apply_a.click(
+                                fn=lambda t=tmpl: (
+                                    gr.update(value=t["prompt"]),
+                                    gr.update(value=t["negative"]),
+                                    gr.update(value=t["settings"]["steps"]),
+                                    gr.update(value=t["settings"]["cfg"]),
+                                    gr.update(value=t["settings"]["sampler"]),
+                                    gr.update(value=t["settings"]["width"]),
+                                    gr.update(value=t["settings"]["height"]),
+                                ),
+                                inputs=[],
+                                outputs=[a_prompt, a_neg, a_steps, a_cfg, a_sampler, a_w, a_h],
+                            )
+
+        # ── Storyboard Tab ──
+        with gr.Tab("Storyboard"):
+            gr.Markdown("**Storyboard Studio** — 複数シーンを順次生成してAI映画を作る。Cinema Preset + Color Grading + ナレーション対応。")
+
+            with gr.Row():
+                sb_project_name = gr.Textbox(value="Untitled Project", label="Project Name", scale=2)
+                sb_model = gr.Dropdown(
+                    choices=_get_models_for_backend() + list(FAL_MODELS.keys()),
+                    value=list(FAL_MODELS.keys())[0] if FAL_MODELS else None,
+                    label="Video/Image Model",
+                    scale=2,
+                )
+                sb_total_info = gr.Textbox(label="Status", interactive=False, scale=1)
+
+            # Scene inputs (up to 6 scenes)
+            sb_scenes = []
+            for i in range(6):
+                with gr.Accordion(f"Scene {i+1}", open=(i == 0)):
+                    with gr.Row():
+                        sp = gr.Textbox(label=f"Scene {i+1} Prompt", lines=2, placeholder="A woman walks through neon-lit Tokyo...", scale=3)
+                        sc = gr.Dropdown(choices=list(CINEMA_PRESETS.keys()), value="Cinematic Blockbuster", label="Camera", scale=1)
+                        sg = gr.Dropdown(choices=list(COLOR_GRADE_PRESETS.keys()), value="(なし)", label="Color Grade", scale=1)
+                    with gr.Row():
+                        sn = gr.Textbox(label="Narration (optional)", placeholder="The city never sleeps...", scale=3)
+                        sd = gr.Slider(3, 15, value=5, step=1, label="Duration (sec)", scale=1)
+                    sb_scenes.append({"prompt": sp, "cinema": sc, "grade": sg, "narration": sn, "duration": sd})
+
+            sb_gallery = gr.Gallery(label="Generated Scenes", columns=3, height=400)
+            sb_output_info = gr.Textbox(label="Output", interactive=False, lines=3)
+
+            with gr.Row():
+                sb_generate_btn = gr.Button("Generate All Scenes", variant="primary", size="lg")
+                sb_stitch_btn = gr.Button("Stitch Video (ffmpeg)", variant="secondary", size="lg")
+
+            def generate_storyboard(project_name, model, *scene_args):
+                """Generate all storyboard scenes sequentially."""
+                # Unpack scene args (5 per scene: prompt, cinema, grade, narration, duration)
+                all_images = []
+                output_lines = [f"Project: {project_name}"]
+                scene_count = len(scene_args) // 5
+
+                for i in range(scene_count):
+                    base = i * 5
+                    s_prompt = scene_args[base]
+                    s_cinema = scene_args[base + 1]
+                    s_grade = scene_args[base + 2]
+                    s_narration = scene_args[base + 3]
+                    s_duration = scene_args[base + 4]
+
+                    if not s_prompt or not s_prompt.strip():
+                        continue
+
+                    # Apply cinema preset
+                    final_prompt = s_prompt
+                    if s_cinema and s_cinema != "(なし)" and s_cinema in CINEMA_PRESETS:
+                        final_prompt += CINEMA_PRESETS[s_cinema]
+
+                    output_lines.append(f"Scene {i+1}: generating...")
+
+                    try:
+                        images, info = generate_image(
+                            final_prompt, config["default_negative_prompt"],
+                            model, "None", 0.8, "None",
+                            config["default_width"], config["default_height"],
+                            25, 7, "dpmpp_2m_sde", "karras", -1, 1,
+                            False, 1.5, 0.5, 15, "None", "normal",
+                            False, 0.4, 512,
+                        )
+                        # Apply color grade
+                        if s_grade and s_grade != "(なし)" and images:
+                            images = [apply_color_grade(img, s_grade) if isinstance(img, Image.Image) else img for img in images]
+
+                        all_images.extend(images)
+                        output_lines.append(f"Scene {i+1}: done ({info})")
+                    except Exception as e:
+                        output_lines.append(f"Scene {i+1}: FAILED - {e}")
+
+                status = f"{len(all_images)} scenes generated"
+                return all_images, "\n".join(output_lines), status
+
+            # Collect all scene inputs
+            all_scene_inputs = []
+            for s in sb_scenes:
+                all_scene_inputs.extend([s["prompt"], s["cinema"], s["grade"], s["narration"], s["duration"]])
+
+            sb_generate_btn.click(
+                fn=generate_storyboard,
+                inputs=[sb_project_name, sb_model] + all_scene_inputs,
+                outputs=[sb_gallery, sb_output_info, sb_total_info],
+            )
+
+            def stitch_scenes():
+                """Stitch generated scene images into a video slideshow using ffmpeg."""
+                output_dir = config["output_dir_normal"]
+                # Get latest images
+                images = sorted(
+                    [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.endswith((".png", ".jpg"))],
+                    key=os.path.getmtime, reverse=True
+                )[:6]  # Last 6 images
+
+                if len(images) < 2:
+                    return "Need at least 2 generated scenes to stitch."
+
+                output_path = os.path.join(output_dir, f"storyboard_{int(time.time())}.mp4")
+                # Create ffmpeg slideshow (5 seconds per image with fade transitions)
+                list_file = os.path.join(output_dir, "concat_list.txt")
+                with open(list_file, "w") as f:
+                    for img in images:
+                        f.write(f"file '{img}'\nduration 5\n")
+                    f.write(f"file '{images[-1]}'\n")  # Last image needs no duration
+
+                try:
+                    subprocess.run([
+                        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
+                        "-vf", "scale=1024:768:force_original_aspect_ratio=decrease,pad=1024:768:-1:-1:color=black",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+                        output_path
+                    ], capture_output=True, text=True, timeout=60)
+                    os.remove(list_file)
+                    return f"Video saved: {output_path}"
+                except Exception as e:
+                    return f"ffmpeg error: {e}"
+
+            sb_stitch_btn.click(fn=stitch_scenes, outputs=[sb_output_info])
 
         # ── Settings Tab ──
         with gr.Tab("Settings"):
@@ -2688,10 +6842,10 @@ SETTINGS: Model=xxx | Steps=xx | CFG=x.x | Size=WxH | Sampler=xxx | Scheduler=xx
                 gr.Markdown("### Backend (バックエンド切り替え)")
                 with gr.Row():
                     s_backend = gr.Radio(
-                        choices=["fal", "replicate", "together", "dezgo", "novita", "civitai", "local"],
+                        choices=["fal", "vast", "replicate", "together", "dezgo", "novita", "civitai", "local"],
                         value=config.get("backend", "local"),
                         label="実行先",
-                        info="fal=Flux推奨 / replicate=万能 / together=LoRA / dezgo=無検閲 / novita=最安 / civitai=SDXL / local=Mac",
+                        info="fal=Flux推奨 / vast=CivitAIモデル自由 / replicate=万能 / together=LoRA / dezgo=無検閲 / novita=最安 / civitai=SDXL / local=Mac",
                     )
                     backend_status = gr.Textbox(label="切り替え状況", interactive=False)
                 s_backend.change(fn=lambda choice: switch_backend(choice)[0], inputs=[s_backend], outputs=[backend_status])
@@ -2813,6 +6967,187 @@ SETTINGS: Model=xxx | Steps=xx | CFG=x.x | Size=WxH | Sampler=xxx | Scheduler=xx
                 runpod_retry_btn.click(fn=runpod_retry_until_available, inputs=[runpod_gpu_select, runpod_template_select], outputs=[runpod_status])
 
             with gr.Group():
+                gr.Markdown("### Vast.ai Cloud GPU (CivitAIモデル自由使用)")
+                gr.Markdown(
+                    "**Vast.ai** — RunPodより安い。CivitAIモデルを自由にDLして使える。\n\n"
+                    "1. [vast.ai](https://vast.ai/) でアカウント作成 → API Key取得\n"
+                    "2. 下でGPU検索 → インスタンス作成\n"
+                    "3. モデルパック選択で推奨NSFWモデルが自動DL\n"
+                    "4. Backend を `vast` に切り替え"
+                )
+                s_vast_key = gr.Textbox(
+                    label="Vast.ai API Key",
+                    value=config.get("vast_api_key", ""),
+                    type="password",
+                    info="https://cloud.vast.ai/api/ から取得",
+                )
+
+                with gr.Row():
+                    vast_max_price = gr.Slider(0.1, 2.0, value=0.5, step=0.05, label="最大料金 ($/hr)")
+                    vast_min_vram = gr.Slider(8, 48, value=16, step=4, label="最小VRAM (GB)")
+
+                vast_offers_display = gr.Textbox(label="利用可能なGPU", lines=8, interactive=False)
+                vast_search_btn = gr.Button("GPU検索", variant="secondary")
+
+                def vast_search_gpus(max_price, min_vram):
+                    if not vastai.api_key:
+                        return "Vast.ai API Key が未設定です"
+                    try:
+                        offers = vastai.search_offers(min_gpu_ram=int(min_vram), max_price=float(max_price))
+                        return vastai.format_offers(offers)
+                    except Exception as e:
+                        return f"検索エラー: {e}"
+
+                vast_search_btn.click(fn=vast_search_gpus, inputs=[vast_max_price, vast_min_vram], outputs=[vast_offers_display])
+
+                gr.Markdown("#### インスタンス作成")
+                with gr.Row():
+                    vast_offer_id = gr.Number(label="Offer ID (上の検索結果から)", precision=0)
+                    vast_image = gr.Dropdown(
+                        choices=list(COMFYUI_IMAGES.keys()),
+                        value=list(COMFYUI_IMAGES.keys())[0],
+                        label="Docker Image",
+                    )
+                    vast_model_pack = gr.Radio(
+                        choices=["starter", "full", "none"],
+                        value="starter",
+                        label="モデルパック",
+                        info="starter=RealVisXL+基本(7GB) / full=全推奨モデル(27GB) / none=モデルDLなし",
+                    )
+                vast_disk = gr.Slider(20, 100, value=50, step=10, label="ディスク容量 (GB)")
+
+                vast_status = gr.Textbox(label="Vast.ai Status", lines=6, interactive=False)
+                with gr.Row():
+                    vast_create_btn = gr.Button("インスタンス作成", variant="primary")
+                    vast_stop_btn = gr.Button("停止", variant="stop")
+                    vast_start_btn = gr.Button("再開")
+                    vast_destroy_btn = gr.Button("削除 (永久)", variant="stop")
+                vast_check_btn = gr.Button("状態確認 / 接続")
+
+                def vast_create_instance(offer_id, image_key, model_pack, disk):
+                    if not vastai.api_key:
+                        return "Vast.ai API Key が未設定です"
+                    if not offer_id or offer_id <= 0:
+                        return "Offer IDを入力してください（GPU検索結果の右端の数字）"
+                    try:
+                        result = vastai.create_instance(
+                            offer_id=int(offer_id),
+                            image_key=image_key,
+                            disk_gb=int(disk),
+                            model_pack=model_pack,
+                        )
+                        inst_id = result.get("new_contract")
+                        if inst_id:
+                            config["vast_instance_id"] = inst_id
+                            save_config(config)
+                            return (
+                                f"インスタンス作成成功! ID: {inst_id}\n"
+                                f"モデルパック: {model_pack}\n"
+                                f"起動中... 「状態確認/接続」で接続してください。\n"
+                                f"（モデルDL含め3-10分かかります）"
+                            )
+                        return f"作成結果: {json.dumps(result, indent=2)}"
+                    except Exception as e:
+                        return f"作成エラー: {e}"
+
+                def vast_check_status():
+                    if not vastai.api_key:
+                        return "Vast.ai API Key が未設定です"
+                    try:
+                        instances = vastai.get_instances()
+                        if not instances:
+                            return "稼働中のインスタンスはありません。"
+
+                        lines = [format_cost_summary(instances), ""]
+                        for inst in instances:
+                            lines.append(format_instance_status(inst))
+                            lines.append("")
+
+                            # Try to connect to ComfyUI
+                            if inst.get("actual_status") == "running":
+                                url = vastai.get_comfyui_url(inst)
+                                if url:
+                                    try:
+                                        urllib.request.urlopen(f"{url}/system_stats", timeout=5)
+                                        config["vast_comfyui_url"] = url
+                                        config["comfyui_url"] = url
+                                        config["vast_instance_id"] = inst.get("id")
+                                        client.server_url = url
+                                        save_config(config)
+                                        lines.append(f"ComfyUI接続済み: {url}")
+                                    except Exception:
+                                        lines.append(f"ComfyUI起動待ち... URL: {url}")
+
+                        return "\n".join(lines)
+                    except Exception as e:
+                        return f"確認エラー: {e}"
+
+                def vast_stop():
+                    inst_id = config.get("vast_instance_id")
+                    if not inst_id:
+                        return "インスタンスIDが不明です。状態確認を先に実行してください。"
+                    try:
+                        vastai.stop_instance(inst_id)
+                        return f"インスタンス {inst_id} を停止しました。"
+                    except Exception as e:
+                        return f"停止エラー: {e}"
+
+                def vast_start():
+                    inst_id = config.get("vast_instance_id")
+                    if not inst_id:
+                        return "インスタンスIDが不明です。"
+                    try:
+                        vastai.start_instance(inst_id)
+                        return f"インスタンス {inst_id} を再開しました。接続は「状態確認」で。"
+                    except Exception as e:
+                        return f"再開エラー: {e}"
+
+                def vast_destroy():
+                    inst_id = config.get("vast_instance_id")
+                    if not inst_id:
+                        return "インスタンスIDが不明です。"
+                    try:
+                        vastai.destroy_instance(inst_id)
+                        config.pop("vast_instance_id", None)
+                        config.pop("vast_comfyui_url", None)
+                        save_config(config)
+                        return f"インスタンス {inst_id} を完全削除しました。"
+                    except Exception as e:
+                        return f"削除エラー: {e}"
+
+                vast_create_btn.click(fn=vast_create_instance,
+                                      inputs=[vast_offer_id, vast_image, vast_model_pack, vast_disk],
+                                      outputs=[vast_status])
+                vast_check_btn.click(fn=vast_check_status, outputs=[vast_status])
+                vast_stop_btn.click(fn=vast_stop, outputs=[vast_status])
+                vast_start_btn.click(fn=vast_start, outputs=[vast_status])
+                vast_destroy_btn.click(fn=vast_destroy, outputs=[vast_status])
+
+                gr.Markdown("#### 推奨CivitAIモデル一覧")
+                _model_info_lines = []
+                for name, info in VAST_MODELS.items():
+                    _model_info_lines.append(f"- **{name}** ({info['type']}, {info['size']}) — {info['desc']}")
+                gr.Markdown("\n".join(_model_info_lines))
+
+                gr.Markdown("#### カスタムCivitAIモデルDL")
+                gr.Markdown("CivitAI URLからモデルをDLするwgetコマンドを生成。SSHでインスタンスに接続して実行。")
+                with gr.Row():
+                    vast_civitai_url = gr.Textbox(label="CivitAI Download URL", placeholder="https://civitai.com/api/download/models/...")
+                    vast_model_type = gr.Dropdown(
+                        choices=["checkpoint", "lora", "vae", "embedding", "controlnet", "upscaler"],
+                        value="checkpoint", label="モデルタイプ",
+                    )
+                vast_dl_cmd_output = gr.Textbox(label="実行コマンド (SSHで実行)", lines=2, interactive=False)
+
+                def gen_dl_cmd(url, mtype):
+                    if not url:
+                        return ""
+                    return vastai.generate_civitai_download_command(url, mtype)
+
+                vast_civitai_url.change(fn=gen_dl_cmd, inputs=[vast_civitai_url, vast_model_type], outputs=[vast_dl_cmd_output])
+                vast_model_type.change(fn=gen_dl_cmd, inputs=[vast_civitai_url, vast_model_type], outputs=[vast_dl_cmd_output])
+
+            with gr.Group():
                 gr.Markdown("### API Keys")
                 s_replicate_key = gr.Textbox(
                     label="Replicate API Key (推奨 - Flux/SDXL/動画生成)",
@@ -2889,6 +7224,17 @@ SETTINGS: Model=xxx | Steps=xx | CFG=x.x | Size=WxH | Sampler=xxx | Scheduler=xx
                 gdrive_status = gr.Textbox(label="リンク状況", interactive=False)
 
             with gr.Group():
+                gr.Markdown("### iCloud Models")
+                gr.Markdown(
+                    "iCloudにダウンロードしたCivitAIモデルを直接読み込みます。\n"
+                    "フォルダにsafetensorsファイルを入れるだけでOK。\n\n"
+                    "例: `~/Library/Mobile Documents/com~apple~CloudDocs/civitai-model`"
+                )
+                s_icloud = gr.Textbox(label="iCloud Models Path", value=config.get("icloud_models_dir", ""))
+                icloud_link_btn = gr.Button("iCloud モデルをリンク")
+                icloud_status = gr.Textbox(label="リンク状況", interactive=False)
+
+            with gr.Group():
                 gr.Markdown("### Server")
                 s_comfyui_url_display = gr.Textbox(label="ComfyUI Server URL (自動設定)", value=config["comfyui_url"], interactive=False)
 
@@ -2945,13 +7291,70 @@ SETTINGS: Model=xxx | Steps=xx | CFG=x.x | Size=WxH | Sampler=xxx | Scheduler=xx
 
             save_btn.click(
                 fn=save_settings,
-                inputs=[s_output_normal, s_output_adult, s_gdrive, s_comfyui_url_display, s_runpod_key, s_backend, s_replicate_key, s_fal_key, s_together_key, s_dezgo_key, s_novita_key, s_civitai_key, s_anthropic_key, s_openai_key, s_xai_key],
+                inputs=[s_output_normal, s_output_adult, s_gdrive, s_icloud, s_comfyui_url_display, s_runpod_key, s_backend, s_replicate_key, s_fal_key, s_together_key, s_dezgo_key, s_novita_key, s_civitai_key, s_anthropic_key, s_openai_key, s_xai_key, s_vast_key],
                 outputs=[save_status],
             )
             gdrive_link_btn.click(fn=link_google_drive, inputs=[s_gdrive], outputs=[gdrive_status])
+            icloud_link_btn.click(fn=link_icloud_models, inputs=[s_icloud], outputs=[icloud_status])
             open_normal_btn.click(fn=lambda: open_folder(config["output_dir_normal"]), outputs=[save_status])
             open_adult_btn.click(fn=lambda: open_folder(config["output_dir_adult"]), outputs=[save_status])
             open_models_btn.click(fn=lambda: open_folder(config["models_dir"]), outputs=[save_status])
+
+    # ── Session & Shutdown (tabs外、画面下部) ──
+    gr.Markdown("---")
+    with gr.Row():
+        with gr.Column(scale=3):
+            with gr.Row():
+                session_save_btn = gr.Button("作業を保存", variant="secondary", size="sm")
+                session_restore_btn = gr.Button("前回の作業を復元", variant="secondary", size="sm")
+            session_status = gr.Textbox(label="", interactive=False, max_lines=1)
+        with gr.Column(scale=1):
+            shutdown_btn = gr.Button("アプリを終了", variant="stop", size="lg")
+
+    # Session save: capture key inputs from Quick and Adult tabs
+    def do_save_session(q_p, q_n, q_m, q_s, q_c, a_p, a_n, a_m, a_s, a_c):
+        data = {
+            "saved_at": datetime.datetime.now().isoformat(),
+            "quick": {"prompt": q_p, "negative": q_n, "model": q_m, "steps": q_s, "cfg": q_c},
+            "adult": {"prompt": a_p, "negative": a_n, "model": a_m, "steps": a_s, "cfg": a_c},
+        }
+        if save_session(data):
+            return f"保存完了 ({data['saved_at'][:19]})"
+        return "保存に失敗しました"
+
+    def do_restore_session():
+        data = load_session()
+        if not data:
+            return ("", "", None, 25, 7.0, "", "", None, 25, 7.0, "保存データがありません")
+        q = data.get("quick", {})
+        a = data.get("adult", {})
+        saved = data.get("saved_at", "不明")[:19]
+        return (
+            q.get("prompt", ""), q.get("negative", ""), q.get("model"), q.get("steps", 25), q.get("cfg", 7.0),
+            a.get("prompt", ""), a.get("negative", ""), a.get("model"), a.get("steps", 25), a.get("cfg", 7.0),
+            f"復元完了 (保存時刻: {saved})",
+        )
+
+    def do_shutdown():
+        shutdown_app()
+        return "シャットダウン中..."
+
+    session_save_btn.click(
+        fn=do_save_session,
+        inputs=[q_prompt, q_neg, q_model, q_steps, q_cfg,
+                a_prompt, a_neg, a_model, a_steps, a_cfg],
+        outputs=[session_status],
+    )
+
+    session_restore_btn.click(
+        fn=do_restore_session,
+        inputs=[],
+        outputs=[q_prompt, q_neg, q_model, q_steps, q_cfg,
+                 a_prompt, a_neg, a_model, a_steps, a_cfg,
+                 session_status],
+    )
+
+    shutdown_btn.click(fn=do_shutdown, outputs=[session_status])
 
 
 if __name__ == "__main__":
@@ -2960,4 +7363,9 @@ if __name__ == "__main__":
         server_port=7860,
         share=False,
         theme=gr.themes.Soft(),
+        allowed_paths=[
+            config.get("output_dir_normal", "./outputs/normal"),
+            config.get("output_dir_adult", "./outputs/adult"),
+            os.path.dirname(os.path.abspath(__file__)),
+        ],
     )

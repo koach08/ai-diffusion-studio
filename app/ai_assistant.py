@@ -76,7 +76,7 @@ def build_system_prompt(config, mode="general"):
 # API Providers
 # ──────────────────────────────────────────────
 
-def _call_anthropic(api_key, system, messages, model="claude-sonnet-4-20250514"):
+def _call_anthropic(api_key, system, messages, model="claude-sonnet-4-6"):
     payload = {
         "model": model,
         "max_tokens": 2048,
@@ -99,7 +99,7 @@ def _call_anthropic(api_key, system, messages, model="claude-sonnet-4-20250514")
     return result["content"][0]["text"]
 
 
-def _call_openai(api_key, system, messages, model="gpt-4o-mini"):
+def _call_openai(api_key, system, messages, model="gpt-4.1-mini"):
     oai_messages = [{"role": "system", "content": system}] + messages
     payload = {
         "model": model,
