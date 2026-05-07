@@ -362,12 +362,69 @@ def _resolve_lora_to_url(lora_name: str) -> str | None:
     return None
 
 
-def save_image_to_dir(image, output_dir, prefix="img"):
+def _build_a1111_parameters(meta):
+    """Build A1111-style parameters string. CivitAI / Civitai Helper / A1111 が読める形式。"""
+    if not meta:
+        return None
+    prompt = (meta.get("prompt") or "").strip()
+    negative = (meta.get("negative_prompt") or "").strip()
+    parts = [prompt] if prompt else []
+    if negative:
+        parts.append(f"Negative prompt: {negative}")
+    kv = []
+    for key, label in [
+        ("steps", "Steps"), ("sampler", "Sampler"), ("cfg", "CFG scale"),
+        ("seed", "Seed"), ("size", "Size"), ("model", "Model"),
+        ("vae", "VAE"), ("denoise", "Denoising strength"),
+        ("clip_skip", "Clip skip"), ("scheduler", "Schedule type"),
+    ]:
+        v = meta.get(key)
+        if v not in (None, "", "None"):
+            kv.append(f"{label}: {v}")
+    lora = meta.get("lora")
+    if lora and lora not in ("None", ""):
+        strength = meta.get("lora_strength", 1.0)
+        kv.append(f'Lora hashes: "{lora}: {strength}"')
+    backend = meta.get("backend")
+    if backend:
+        kv.append(f"Backend: {backend}")
+    if kv:
+        parts.append(", ".join(kv))
+    return "\n".join(parts) if parts else None
+
+
+def save_image_to_dir(image, output_dir, prefix="img", meta=None):
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{prefix}_{timestamp}.png"
     filepath = os.path.join(output_dir, filename)
-    image.save(filepath)
+
+    pnginfo = None
+    try:
+        from PIL.PngImagePlugin import PngInfo
+        pnginfo = PngInfo()
+        if hasattr(image, "info") and image.info:
+            for k, v in image.info.items():
+                if isinstance(v, (str, bytes)) and k.lower() not in ("parameters",):
+                    try:
+                        pnginfo.add_text(str(k), v if isinstance(v, str) else v.decode("utf-8", "ignore"))
+                    except Exception:
+                        pass
+        params = _build_a1111_parameters(meta) if meta else None
+        if params:
+            pnginfo.add_text("parameters", params)
+        if meta:
+            try:
+                pnginfo.add_text("ai-diffusion", json.dumps(meta, ensure_ascii=False, default=str))
+            except Exception:
+                pass
+    except Exception:
+        pnginfo = None
+
+    if pnginfo is not None:
+        image.save(filepath, pnginfo=pnginfo)
+    else:
+        image.save(filepath)
     return filepath
 
 
@@ -431,10 +488,16 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
                 images = []
                 saved_paths = []
                 output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+                fal_meta = {
+                    "prompt": prompt, "negative_prompt": negative_prompt,
+                    "model": model_key, "seed": seed, "size": f"{w}x{h}",
+                    "lora": lora if lora_urls else None, "lora_strength": lora_strength,
+                    "backend": f"fal.ai ({model_key})",
+                }
                 for url in urls:
                     img = download_fal_image(url)
                     images.append(img)
-                    path = save_image_to_dir(img, output_dir, prefix=f"fal_{mode}")
+                    path = save_image_to_dir(img, output_dir, prefix=f"fal_{mode}", meta=fal_meta)
                     saved_paths.append(path)
 
                 lora_label = f" + LoRA: {lora}" if lora_urls else ""
@@ -462,10 +525,15 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
             images = []
             saved_paths = []
             output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+            together_meta = {
+                "prompt": prompt, "negative_prompt": negative_prompt,
+                "model": model_key, "seed": seed, "size": f"{w}x{h}",
+                "backend": f"Together.ai ({model_key})",
+            }
             for b64 in b64_images:
                 img = decode_together_image(b64)
                 images.append(img)
-                path = save_image_to_dir(img, output_dir, prefix=f"together_{mode}")
+                path = save_image_to_dir(img, output_dir, prefix=f"together_{mode}", meta=together_meta)
                 saved_paths.append(path)
             cost = TOGETHER_MODELS.get(model_key, {}).get("cost", "?")
             return images, f"[Together.ai {model_key}] コスト: {cost}\n保存先: {', '.join(saved_paths)}"
@@ -488,7 +556,12 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
             )
             img = decode_dezgo_image(png_bytes)
             output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
-            path = save_image_to_dir(img, output_dir, prefix=f"dezgo_{mode}")
+            dezgo_meta = {
+                "prompt": prompt, "negative_prompt": negative_prompt,
+                "model": model_key, "seed": seed, "size": f"{w}x{h}",
+                "backend": f"Dezgo ({model_key})",
+            }
+            path = save_image_to_dir(img, output_dir, prefix=f"dezgo_{mode}", meta=dezgo_meta)
             cost = DEZGO_IMAGE_MODELS.get(model_key, {}).get("cost", "?")
             return [img], f"[Dezgo {model_key}] コスト: {cost}\n保存先: {path}"
         except Exception as e:
@@ -511,10 +584,15 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
             images = []
             saved_paths = []
             output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+            novita_meta = {
+                "prompt": prompt, "negative_prompt": negative_prompt,
+                "model": model_key, "seed": seed, "size": f"{w}x{h}",
+                "backend": f"Novita.ai ({model_key})",
+            }
             for url in urls:
                 img = download_novita_image(url)
                 images.append(img)
-                path = save_image_to_dir(img, output_dir, prefix=f"novita_{mode}")
+                path = save_image_to_dir(img, output_dir, prefix=f"novita_{mode}", meta=novita_meta)
                 saved_paths.append(path)
             cost = NOVITA_MODELS.get(model_key, {}).get("cost", "?")
             return images, f"[Novita.ai {model_key}] コスト: {cost}\n保存先: {', '.join(saved_paths)}"
@@ -569,10 +647,18 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
                 images = []
                 saved_paths = []
                 output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+                ci_meta = {
+                    "prompt": prompt, "negative_prompt": negative_prompt,
+                    "model": urn_info.get("name") or icloud_filename,
+                    "steps": steps, "cfg": cfg, "sampler": sampler, "scheduler": scheduler,
+                    "seed": seed, "size": f"{int(width)}x{int(height)}",
+                    "lora": lora if lora_urns else None, "lora_strength": lora_strength,
+                    "backend": "CivitAI Orchestration (iCloud URN)",
+                }
                 for url in urls:
                     img = download_url_to_pil(url)
                     images.append(img)
-                    path = save_image_to_dir(img, output_dir, prefix=f"civitai_icloud_{mode}")
+                    path = save_image_to_dir(img, output_dir, prefix=f"civitai_icloud_{mode}", meta=ci_meta)
                     saved_paths.append(path)
 
                 cost = urn_info.get("cost", "~4 Buzz")
@@ -606,10 +692,18 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
             images = []
             saved_paths = []
             output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+            civ_meta = {
+                "prompt": prompt, "negative_prompt": negative_prompt,
+                "model": civitai_model_key,
+                "steps": steps, "cfg": cfg, "sampler": sampler, "scheduler": scheduler,
+                "seed": seed, "size": f"{int(width)}x{int(height)}",
+                "lora": lora if lora_urns else None, "lora_strength": lora_strength,
+                "backend": f"CivitAI Orchestration ({civitai_model_key})",
+            }
             for url in urls:
                 img = download_url_to_pil(url)
                 images.append(img)
-                path = save_image_to_dir(img, output_dir, prefix=f"civitai_{mode}")
+                path = save_image_to_dir(img, output_dir, prefix=f"civitai_{mode}", meta=civ_meta)
                 saved_paths.append(path)
 
             cost = CIVITAI_GENERATION_MODELS.get(civitai_model_key, {}).get("cost", "?")
@@ -650,10 +744,15 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
             images = []
             saved_paths = []
             output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
+            rep_meta = {
+                "prompt": prompt, "negative_prompt": negative_prompt,
+                "model": model_key, "seed": seed, "size": f"{w}x{h}",
+                "backend": f"Replicate ({model_key})",
+            }
             for url in urls:
                 img = download_url_to_pil(url)
                 images.append(img)
-                path = save_image_to_dir(img, output_dir, prefix=f"replicate_{mode}")
+                path = save_image_to_dir(img, output_dir, prefix=f"replicate_{mode}", meta=rep_meta)
                 saved_paths.append(path)
 
             from replicate_api import MODELS as REPLICATE_MODELS_MAP
@@ -713,8 +812,16 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
 
     output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
     saved_paths = []
+    comfy_meta = {
+        "prompt": prompt, "negative_prompt": negative_prompt,
+        "model": model, "vae": vae_name,
+        "steps": steps, "cfg": cfg, "sampler": sampler, "scheduler": scheduler,
+        "seed": seed, "size": f"{int(width)}x{int(height)}",
+        "lora": lora_name or None, "lora_strength": lora_strength,
+        "backend": f"ComfyUI ({backend})",
+    }
     for img in images:
-        path = save_image_to_dir(img, output_dir, prefix=mode)
+        path = save_image_to_dir(img, output_dir, prefix=mode, meta=comfy_meta)
         saved_paths.append(path)
 
     hires_info = f" [Hires Fix: {hires_scale}x, denoise={hires_denoise}]" if hires_fix else ""
@@ -1905,50 +2012,47 @@ from vision_analyzer import (
 
 
 def _get_vision_keys():
-    """Return (openai_key, anthropic_key) tuple from config."""
+    """Return (openai_key, anthropic_key, xai_key, fal_key) tuple from config.
+
+    xai_key (Grok) is the primary path for NSFW; fal_key enables Florence-2 fallback.
+    """
     return (
         config.get("openai_api_key", ""),
         config.get("anthropic_api_key", ""),
+        config.get("xai_api_key", ""),
+        config.get("fal_api_key", ""),
     )
 
 
-def img2vid_analyze_motion(image):
-    """Auto-analyze image for natural motion prompt (Preserve mode helper).
-
-    Called by the 'Auto-analyze' button. Returns analyzed motion prompt.
-    """
+def img2vid_analyze_motion(image, mode="normal"):
+    """Auto-analyze image for natural motion prompt (Preserve mode helper)."""
     if image is None:
         raise gr.Error("画像をアップロードしてください。")
-    openai_key, anthropic_key = _get_vision_keys()
-    if not openai_key and not anthropic_key:
+    openai_key, anthropic_key, xai_key, fal_key = _get_vision_keys()
+    if not (openai_key or anthropic_key or xai_key or fal_key):
         raise gr.Error(
-            "OpenAI または Anthropic API Key が必要です。\n"
-            "Settings → OpenAI API Key または Anthropic API Key を設定してください。"
+            "OpenAI / Anthropic / xAI / fal.ai のいずれかの API Key が必要です。\n"
+            "Settingsタブで設定してください。"
         )
     try:
-        motion_prompt = analyze_for_motion(image, openai_key, anthropic_key)
-        return motion_prompt
+        return analyze_for_motion(image, openai_key, anthropic_key, xai_key, fal_key, mode=mode)
     except Exception as e:
         logger.error(f"Image analysis (motion) failed: {traceback.format_exc()}")
         raise gr.Error(f"画像分析エラー: {e}")
 
 
-def img2vid_analyze_inspiration(image):
-    """Auto-analyze image for full scene description (Inspired mode helper).
-
-    Called by the 'Auto-analyze' button. Returns scene description.
-    """
+def img2vid_analyze_inspiration(image, mode="normal"):
+    """Auto-analyze image for full scene description (Inspired mode helper)."""
     if image is None:
         raise gr.Error("画像をアップロードしてください。")
-    openai_key, anthropic_key = _get_vision_keys()
-    if not openai_key and not anthropic_key:
+    openai_key, anthropic_key, xai_key, fal_key = _get_vision_keys()
+    if not (openai_key or anthropic_key or xai_key or fal_key):
         raise gr.Error(
-            "OpenAI または Anthropic API Key が必要です。\n"
-            "Settings → OpenAI API Key または Anthropic API Key を設定してください。"
+            "OpenAI / Anthropic / xAI / fal.ai のいずれかの API Key が必要です。\n"
+            "Settingsタブで設定してください。"
         )
     try:
-        description = describe_for_inspiration(image, openai_key, anthropic_key)
-        return description
+        return describe_for_inspiration(image, openai_key, anthropic_key, xai_key, fal_key, mode=mode)
     except Exception as e:
         logger.error(f"Image analysis (inspiration) failed: {traceback.format_exc()}")
         raise gr.Error(f"画像分析エラー: {e}")
@@ -1980,9 +2084,9 @@ def generate_img2vid_preserve(image, motion_prompt, motion_preset, fal_model_key
     # Auto-analyze if requested and prompt empty
     if auto_analyze and not final_prompt:
         try:
-            openai_key, anthropic_key = _get_vision_keys()
-            if openai_key or anthropic_key:
-                final_prompt = analyze_for_motion(image, openai_key, anthropic_key)
+            openai_key, anthropic_key, xai_key, fal_key = _get_vision_keys()
+            if openai_key or anthropic_key or xai_key or fal_key:
+                final_prompt = analyze_for_motion(image, openai_key, anthropic_key, xai_key, fal_key, mode=mode)
                 logger.info(f"[Preserve] auto motion: {final_prompt[:100]}")
         except Exception as e:
             logger.error(f"Auto-analyze failed, using empty prompt: {e}")
@@ -2028,13 +2132,13 @@ def generate_img2vid_inspired(image, description, style_hint, fal_t2v_model, dur
     # Auto-analyze if no description provided
     if not final_desc:
         try:
-            openai_key, anthropic_key = _get_vision_keys()
-            if not openai_key and not anthropic_key:
+            openai_key, anthropic_key, xai_key, fal_key = _get_vision_keys()
+            if not (openai_key or anthropic_key or xai_key or fal_key):
                 raise gr.Error(
-                    "OpenAI または Anthropic API Key が必要です (画像分析のため)。\n"
+                    "OpenAI / Anthropic / xAI / fal.ai のいずれかの API Key が必要です (画像分析のため)。\n"
                     "Settingsタブで設定するか、説明文を手動入力してください。"
                 )
-            final_desc = describe_for_inspiration(image, openai_key, anthropic_key)
+            final_desc = describe_for_inspiration(image, openai_key, anthropic_key, xai_key, fal_key, mode=mode)
             logger.info(f"[Inspired] auto description: {final_desc[:100]}")
         except gr.Error:
             raise
