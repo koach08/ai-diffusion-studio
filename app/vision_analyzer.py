@@ -1,15 +1,14 @@
 """Vision-based image analysis for img2vid workflows.
 
-Provides two analysis modes:
-- analyze_for_motion(): Extract natural motion description (preserve mode)
-- describe_for_inspiration(): Extract full scene description (inspired mode)
-
-Uses OpenAI GPT-4o or Anthropic Claude vision via urllib (no SDK dependency).
+Mode-aware routing:
+- SFW (mode="normal"): GPT-4o → Claude Opus 4.7 → Grok Vision → Florence-2
+- NSFW (mode="adult"): Grok Vision → Florence-2 (skips OpenAI/Claude — they refuse)
 """
 import base64
 import io
 import json
 import os
+import time
 import urllib.request
 import urllib.error
 
@@ -23,11 +22,9 @@ def _image_to_base64_jpeg(image, max_side=1024):
     elif isinstance(image, Image.Image):
         img = image
     else:
-        # numpy array
         img = Image.fromarray(image)
 
     img = img.convert("RGB")
-    # Downscale to keep token cost low
     w, h = img.size
     if max(w, h) > max_side:
         scale = max_side / max(w, h)
@@ -42,30 +39,24 @@ def _image_to_base64_jpeg(image, max_side=1024):
 # OpenAI GPT-4o vision
 # ──────────────────────────────────────────────
 
-def _call_openai_vision(api_key, prompt, image_b64, model="gpt-4.1", max_tokens=512):
+def _call_openai_vision(api_key, prompt, image_b64, model="gpt-4o", max_tokens=512):
     payload = {
         "model": model,
         "max_tokens": max_tokens,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{image_b64}",
-                            "detail": "low",
-                        },
-                    },
-                ],
-            }
-        ],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{image_b64}",
+                    "detail": "low",
+                }},
+            ],
+        }],
     }
-    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         "https://api.openai.com/v1/chat/completions",
-        data=data,
+        data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
@@ -74,8 +65,7 @@ def _call_openai_vision(api_key, prompt, image_b64, model="gpt-4.1", max_tokens=
     )
     try:
         resp = urllib.request.urlopen(req, timeout=60)
-        result = json.loads(resp.read())
-        return result["choices"][0]["message"]["content"].strip()
+        return json.loads(resp.read())["choices"][0]["message"]["content"].strip()
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"OpenAI Vision API Error ({e.code}): {body[:300]}")
@@ -85,31 +75,23 @@ def _call_openai_vision(api_key, prompt, image_b64, model="gpt-4.1", max_tokens=
 # Anthropic Claude vision
 # ──────────────────────────────────────────────
 
-def _call_claude_vision(api_key, prompt, image_b64, model="claude-sonnet-4-6", max_tokens=512):
+def _call_claude_vision(api_key, prompt, image_b64, model="claude-opus-4-7", max_tokens=512):
     payload = {
         "model": model,
         "max_tokens": max_tokens,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": image_b64,
-                        },
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": image_b64,
+                }},
+                {"type": "text", "text": prompt},
+            ],
+        }],
     }
-    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
-        data=data,
+        data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
             "x-api-key": api_key,
@@ -119,15 +101,114 @@ def _call_claude_vision(api_key, prompt, image_b64, model="claude-sonnet-4-6", m
     )
     try:
         resp = urllib.request.urlopen(req, timeout=60)
-        result = json.loads(resp.read())
-        return result["content"][0]["text"].strip()
+        return json.loads(resp.read())["content"][0]["text"].strip()
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Claude Vision API Error ({e.code}): {body[:300]}")
 
 
 # ──────────────────────────────────────────────
-# High-level analyzers
+# xAI Grok vision (NSFW-tolerant, OpenAI-compatible API)
+# ──────────────────────────────────────────────
+
+def _call_grok_vision(api_key, prompt, image_b64, model="grok-4-fast-non-reasoning", max_tokens=512):
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{image_b64}",
+                    "detail": "high",
+                }},
+            ],
+        }],
+    }
+    req = urllib.request.Request(
+        "https://api.x.ai/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "AI-diffusion/1.0",
+        },
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=90)
+        return json.loads(resp.read())["choices"][0]["message"]["content"].strip()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Grok Vision API Error ({e.code}): {body[:300]}")
+
+
+# ──────────────────────────────────────────────
+# fal.ai Florence-2 (last-resort permissive captioner)
+# ──────────────────────────────────────────────
+
+NSFW_REFUSAL_MARKERS = (
+    "i can't ", "i cannot ", "i won't ", "i'm sorry", "i am sorry",
+    "i'm not able", "i am not able", "i'm unable", "unable to assist",
+    "explicit sexual", "explicit content", "nudity", "pornographic",
+    "sexually explicit", "against my", "policy",
+    "i'd be happy to help with", "share a different image",
+)
+
+
+def _looks_like_refusal(text):
+    if not text:
+        return True
+    head = text.strip().lower()[:300]
+    return any(m in head for m in NSFW_REFUSAL_MARKERS)
+
+
+def _fal_upload_image(api_key, image_bytes, content_type="image/jpeg", filename="image.jpg"):
+    init_req = urllib.request.Request(
+        "https://rest.alpha.fal.ai/storage/upload/initiate",
+        data=json.dumps({"file_name": filename, "content_type": content_type}).encode("utf-8"),
+        headers={"Authorization": f"Key {api_key}", "Content-Type": "application/json"},
+    )
+    init = json.loads(urllib.request.urlopen(init_req, timeout=30).read())
+    put_req = urllib.request.Request(
+        init["upload_url"], data=image_bytes, method="PUT",
+        headers={"Content-Type": content_type},
+    )
+    urllib.request.urlopen(put_req, timeout=60)
+    return init["file_url"]
+
+
+def _fal_run(api_key, model_id, args, timeout=180):
+    submit_req = urllib.request.Request(
+        f"https://queue.fal.run/{model_id}",
+        data=json.dumps(args).encode("utf-8"),
+        headers={"Authorization": f"Key {api_key}", "Content-Type": "application/json"},
+    )
+    submitted = json.loads(urllib.request.urlopen(submit_req, timeout=30).read())
+    status_url = submitted["status_url"]
+    response_url = submitted["response_url"]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        s_req = urllib.request.Request(status_url, headers={"Authorization": f"Key {api_key}"})
+        st = json.loads(urllib.request.urlopen(s_req, timeout=15).read())
+        if st.get("status") == "COMPLETED":
+            r_req = urllib.request.Request(response_url, headers={"Authorization": f"Key {api_key}"})
+            return json.loads(urllib.request.urlopen(r_req, timeout=15).read())
+        if st.get("status") in ("FAILED", "ERROR"):
+            raise RuntimeError(f"fal.ai job failed: {st}")
+        time.sleep(2)
+    raise RuntimeError("fal.ai job timeout")
+
+
+def _call_florence_caption(fal_key, image_b64):
+    image_bytes = base64.b64decode(image_b64)
+    url = _fal_upload_image(fal_key, image_bytes, content_type="image/jpeg")
+    result = _fal_run(fal_key, "fal-ai/florence-2-large/more-detailed-caption", {"image_url": url})
+    return (result.get("results") or "").strip()
+
+
+# ──────────────────────────────────────────────
+# Prompt templates
 # ──────────────────────────────────────────────
 
 MOTION_PROMPT_SYSTEM = """You are an expert cinematographer writing motion prompts for image-to-video AI.
@@ -139,11 +220,6 @@ CRITICAL rules:
 - Describe only small natural motion (hair in breeze, subtle smile, gentle sway, cloth flutter, eye blink, steam rising, water rippling, leaves moving, slow camera push-in)
 - Focus on what is PRESENT in the image, do not invent new elements
 - Output ONLY the motion prompt in English, no preamble, no quotes, no explanation
-
-Examples of good output:
-- "Soft breeze moving her hair gently, subtle smile forming, slow cinematic push-in"
-- "Steam rising from the cup, warm light flickering, shallow depth of field"
-- "Waves gently rolling in, seagulls crossing sky, slow aerial pan"
 """
 
 
@@ -161,59 +237,101 @@ Output a single paragraph in English, 100-250 words, no preamble, ready to use a
 """
 
 
-def analyze_for_motion(image, openai_key="", anthropic_key=""):
-    """Analyze image and return a natural motion prompt (preserve mode).
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
 
-    Returns: motion prompt string suitable for fal.ai img2vid models.
-    """
-    image_b64 = _image_to_base64_jpeg(image, max_side=768)
-
-    # Prefer OpenAI for speed/cost, fall back to Claude
-    errors = []
-    if openai_key:
-        try:
-            return _call_openai_vision(openai_key, MOTION_PROMPT_SYSTEM, image_b64, max_tokens=200)
-        except Exception as e:
-            errors.append(f"OpenAI: {e}")
-
-    if anthropic_key:
-        try:
-            return _call_claude_vision(anthropic_key, MOTION_PROMPT_SYSTEM, image_b64, max_tokens=200)
-        except Exception as e:
-            errors.append(f"Claude: {e}")
-
-    if not openai_key and not anthropic_key:
-        raise RuntimeError("OpenAI または Anthropic API Key が必要です (Settingsタブで設定)")
-    raise RuntimeError("Vision API failed: " + " | ".join(errors))
+def _florence_fallback(fal_key, image_b64, suffix):
+    caption = _call_florence_caption(fal_key, image_b64)
+    if not caption:
+        return None
+    return f"{caption.rstrip('. ')}. {suffix}"
 
 
-def describe_for_inspiration(image, openai_key="", anthropic_key=""):
-    """Analyze image and return a full scene description (inspired mode).
-
-    Returns: paragraph description suitable for text-to-video prompt.
-    """
-    image_b64 = _image_to_base64_jpeg(image, max_side=1024)
-
-    errors = []
-    if openai_key:
-        try:
-            return _call_openai_vision(openai_key, INSPIRATION_SYSTEM, image_b64, max_tokens=500)
-        except Exception as e:
-            errors.append(f"OpenAI: {e}")
-
-    if anthropic_key:
-        try:
-            return _call_claude_vision(anthropic_key, INSPIRATION_SYSTEM, image_b64, max_tokens=500)
-        except Exception as e:
-            errors.append(f"Claude: {e}")
-
-    if not openai_key and not anthropic_key:
-        raise RuntimeError("OpenAI または Anthropic API Key が必要です (Settingsタブで設定)")
-    raise RuntimeError("Vision API failed: " + " | ".join(errors))
+def _try_call(name, fn, errors):
+    """Run a vision call; treat refusal text as a soft failure so we move on."""
+    try:
+        out = fn()
+        if _looks_like_refusal(out):
+            errors.append(f"{name}: refused (NSFW policy)")
+            return None
+        return out
+    except Exception as e:
+        errors.append(f"{name}: {e}")
+        return None
 
 
 # ──────────────────────────────────────────────
-# Motion presets (can be appended to auto-analyzed prompt)
+# High-level analyzers — mode-aware routing
+# ──────────────────────────────────────────────
+
+def _analyze(image, system_prompt, max_tokens, suffix,
+             openai_key, anthropic_key, xai_key, fal_key, mode):
+    """Mode-aware vision analyzer.
+
+    SFW path:  OpenAI → Claude → Grok → Florence-2
+    NSFW path: Grok → Florence-2  (skips OpenAI/Claude — they refuse)
+    """
+    image_b64 = _image_to_base64_jpeg(image, max_side=1024 if max_tokens >= 400 else 768)
+    errors = []
+    is_nsfw = (mode == "adult")
+
+    if not is_nsfw:
+        if openai_key:
+            r = _try_call("OpenAI",
+                          lambda: _call_openai_vision(openai_key, system_prompt, image_b64, max_tokens=max_tokens),
+                          errors)
+            if r:
+                return r
+        if anthropic_key:
+            r = _try_call("Claude",
+                          lambda: _call_claude_vision(anthropic_key, system_prompt, image_b64, max_tokens=max_tokens),
+                          errors)
+            if r:
+                return r
+
+    if xai_key:
+        r = _try_call("Grok",
+                      lambda: _call_grok_vision(xai_key, system_prompt, image_b64, max_tokens=max_tokens),
+                      errors)
+        if r:
+            return r
+
+    if fal_key:
+        try:
+            out = _florence_fallback(fal_key, image_b64, suffix)
+            if out:
+                return out
+        except Exception as e:
+            errors.append(f"fal Florence-2: {e}")
+
+    if not (openai_key or anthropic_key or xai_key or fal_key):
+        raise RuntimeError("OpenAI / Anthropic / xAI / fal.ai のいずれかの API Key が必要です (Settingsタブで設定)")
+    raise RuntimeError("Vision API failed: " + " | ".join(errors))
+
+
+def analyze_for_motion(image, openai_key="", anthropic_key="", xai_key="", fal_key="", mode="normal"):
+    """Returns a natural motion prompt (preserve mode)."""
+    return _analyze(
+        image, MOTION_PROMPT_SYSTEM, max_tokens=200,
+        suffix="Subtle natural motion, slow cinematic push-in, soft ambient movement",
+        openai_key=openai_key, anthropic_key=anthropic_key,
+        xai_key=xai_key, fal_key=fal_key, mode=mode,
+    )
+
+
+def describe_for_inspiration(image, openai_key="", anthropic_key="", xai_key="", fal_key="", mode="normal"):
+    """Returns a full scene description (inspired mode)."""
+    return _analyze(
+        image, INSPIRATION_SYSTEM, max_tokens=500,
+        suffix="Photorealistic, cinematic lighting, shallow depth of field, professional composition",
+        openai_key=openai_key, anthropic_key=anthropic_key,
+        xai_key=xai_key, fal_key=fal_key, mode=mode,
+    )
+
+
+# ──────────────────────────────────────────────
+# Motion presets
 # ──────────────────────────────────────────────
 
 MOTION_PRESETS = {
