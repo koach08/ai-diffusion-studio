@@ -362,12 +362,99 @@ def _resolve_lora_to_url(lora_name: str) -> str | None:
     return None
 
 
-def save_image_to_dir(image, output_dir, prefix="img"):
+def _build_a1111_metadata(meta):
+    """Build an Automatic1111-style 'parameters' string from a metadata dict.
+
+    CivitAI's image uploader extracts this format directly. Mirrors the
+    convention used by stable-diffusion-webui:
+        positive prompt
+        Negative prompt: <neg>
+        Steps: N, Sampler: X, CFG scale: F, Seed: N, Size: WxH, Model: name, ...
+    """
+    if not meta:
+        return ""
+    prompt = (meta.get("prompt") or "").strip()
+    negative = (meta.get("negative_prompt") or "").strip()
+    parts = []
+    if meta.get("steps") is not None:
+        parts.append(f"Steps: {meta['steps']}")
+    if meta.get("sampler"):
+        parts.append(f"Sampler: {meta['sampler']}")
+    if meta.get("scheduler"):
+        parts.append(f"Schedule type: {meta['scheduler']}")
+    if meta.get("cfg") is not None:
+        parts.append(f"CFG scale: {meta['cfg']}")
+    if meta.get("seed") is not None:
+        parts.append(f"Seed: {meta['seed']}")
+    if meta.get("width") and meta.get("height"):
+        parts.append(f"Size: {int(meta['width'])}x{int(meta['height'])}")
+    if meta.get("model"):
+        parts.append(f"Model: {meta['model']}")
+    if meta.get("model_hash"):
+        parts.append(f"Model hash: {meta['model_hash']}")
+    if meta.get("vae"):
+        parts.append(f"VAE: {meta['vae']}")
+    if meta.get("lora"):
+        # A1111 represents loras inline as <lora:name:weight>
+        # but also a separate "Lora hashes" key works for CivitAI
+        parts.append(f"Lora hashes: \"{meta['lora']}: {meta.get('lora_hash', 'unknown')}\"")
+        if meta.get("lora_strength") is not None:
+            parts.append(f"Lora strength: {meta['lora_strength']}")
+    if meta.get("backend"):
+        parts.append(f"Generator: EGAKU AI / AI-diffusion ({meta['backend']})")
+    else:
+        parts.append("Generator: AI-diffusion")
+    parts.append("Source: AI-diffusion (egaku-ai.com)")
+
+    settings_line = ", ".join(parts)
+    if negative:
+        return f"{prompt}\nNegative prompt: {negative}\n{settings_line}"
+    return f"{prompt}\n{settings_line}"
+
+
+def save_image_to_dir(image, output_dir, prefix="img", metadata=None, workflow=None):
+    """Save a PIL image to disk.
+
+    Optional `metadata` dict embeds A1111-compatible 'parameters' text chunk.
+    Optional `workflow` (ComfyUI workflow dict) embeds 'workflow' + 'prompt'
+    chunks so CivitAI can recover the full ComfyUI graph.
+
+    Both formats together maximise CivitAI auto-extraction success.
+    """
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{prefix}_{timestamp}.png"
     filepath = os.path.join(output_dir, filename)
-    image.save(filepath)
+
+    if metadata or workflow:
+        try:
+            from PIL.PngImagePlugin import PngInfo
+            info = PngInfo()
+            if metadata:
+                a1111 = _build_a1111_metadata(metadata)
+                if a1111:
+                    info.add_text("parameters", a1111)
+            if workflow:
+                try:
+                    workflow_json = json.dumps(workflow)
+                    # ComfyUI itself reads both keys depending on version.
+                    info.add_text("workflow", workflow_json)
+                    info.add_text("prompt", workflow_json)
+                except (TypeError, ValueError):
+                    pass
+            image.save(filepath, "PNG", pnginfo=info)
+        except Exception as save_err:
+            # If metadata embedding fails, fall back to plain save so
+            # generation never silently drops images.
+            try:
+                logger = logging.getLogger("ai-diffusion")
+                logger.warning(f"Metadata embed failed, saving without: {save_err}")
+            except Exception:
+                pass
+            image.save(filepath)
+    else:
+        image.save(filepath)
+
     return filepath
 
 
@@ -378,6 +465,23 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
                    face_detailer=False, face_denoise=0.4, face_guide_size=512):
     """Generate image - routes to CivitAI / Replicate API / ComfyUI based on backend."""
     backend = config.get("backend", "local")
+
+    # Build CivitAI-friendly metadata once, reuse at every save call.
+    base_meta = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "model": model or "",
+        "width": width,
+        "height": height,
+        "steps": steps,
+        "cfg": cfg,
+        "sampler": sampler,
+        "scheduler": scheduler,
+        "seed": seed,
+        "vae": "" if not vae or vae == "None" else vae,
+        "lora": "" if not lora or lora == "None" else lora,
+        "lora_strength": lora_strength if lora and lora != "None" else None,
+    }
 
     # ── fal.ai backend: Flux quality, NSFW OK ──
     if backend == "fal":
@@ -434,7 +538,8 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
                 for url in urls:
                     img = download_fal_image(url)
                     images.append(img)
-                    path = save_image_to_dir(img, output_dir, prefix=f"fal_{mode}")
+                    path = save_image_to_dir(img, output_dir, prefix=f"fal_{mode}",
+                                              metadata={**base_meta, "backend": f"fal.ai/{model_key}"})
                     saved_paths.append(path)
 
                 lora_label = f" + LoRA: {lora}" if lora_urls else ""
@@ -488,7 +593,8 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
             )
             img = decode_dezgo_image(png_bytes)
             output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
-            path = save_image_to_dir(img, output_dir, prefix=f"dezgo_{mode}")
+            path = save_image_to_dir(img, output_dir, prefix=f"dezgo_{mode}",
+                                      metadata={**base_meta, "backend": f"dezgo/{model_key}"})
             cost = DEZGO_IMAGE_MODELS.get(model_key, {}).get("cost", "?")
             return [img], f"[Dezgo {model_key}] コスト: {cost}\n保存先: {path}"
         except Exception as e:
@@ -514,7 +620,8 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
             for url in urls:
                 img = download_novita_image(url)
                 images.append(img)
-                path = save_image_to_dir(img, output_dir, prefix=f"novita_{mode}")
+                path = save_image_to_dir(img, output_dir, prefix=f"novita_{mode}",
+                                          metadata={**base_meta, "backend": f"novita/{model_key}"})
                 saved_paths.append(path)
             cost = NOVITA_MODELS.get(model_key, {}).get("cost", "?")
             return images, f"[Novita.ai {model_key}] コスト: {cost}\n保存先: {', '.join(saved_paths)}"
@@ -572,7 +679,8 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
                 for url in urls:
                     img = download_url_to_pil(url)
                     images.append(img)
-                    path = save_image_to_dir(img, output_dir, prefix=f"civitai_icloud_{mode}")
+                    path = save_image_to_dir(img, output_dir, prefix=f"civitai_icloud_{mode}",
+                                              metadata={**base_meta, "backend": f"civitai/{urn_info.get('name','')}"})
                     saved_paths.append(path)
 
                 cost = urn_info.get("cost", "~4 Buzz")
@@ -609,7 +717,8 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
             for url in urls:
                 img = download_url_to_pil(url)
                 images.append(img)
-                path = save_image_to_dir(img, output_dir, prefix=f"civitai_{mode}")
+                path = save_image_to_dir(img, output_dir, prefix=f"civitai_{mode}",
+                                          metadata={**base_meta, "backend": f"civitai/{civitai_model_key}"})
                 saved_paths.append(path)
 
             cost = CIVITAI_GENERATION_MODELS.get(civitai_model_key, {}).get("cost", "?")
@@ -714,7 +823,9 @@ def generate_image(prompt, negative_prompt, model, lora, lora_strength, vae,
     output_dir = config["output_dir_adult"] if mode == "adult" else config["output_dir_normal"]
     saved_paths = []
     for img in images:
-        path = save_image_to_dir(img, output_dir, prefix=mode)
+        path = save_image_to_dir(img, output_dir, prefix=mode,
+                                  metadata={**base_meta, "backend": "ComfyUI (local)"},
+                                  workflow=workflow)
         saved_paths.append(path)
 
     hires_info = f" [Hires Fix: {hires_scale}x, denoise={hires_denoise}]" if hires_fix else ""
